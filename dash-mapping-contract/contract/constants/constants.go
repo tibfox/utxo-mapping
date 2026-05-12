@@ -90,19 +90,35 @@ const BackupPublicKeyStateKey = "backupkey"
 
 const BlockPrefix = "b" + DirPathDelimiter
 
-// ISLockedClaimedPrefix marks deposit txs that have already been credited via
-// the InstantSend fast path (mapInstantSend action). Key: "il-<txid>",
-// value: "1" when claimed.
+// ISLockedClaimedPrefix marks deposit txs that have already been credited.
+// Key: "il-<txid>", value: one of ISLockedMarker* below.
 //
-// Purpose: prevent double-credit when an IS-locked deposit later lands in a
-// block. The bot will submit the same tx through the normal `map` action
-// once the block confirms; HandleMap consults this set first and short-
-// circuits if the marker is present (then clears it).
+// The marker is set by either action (mapInstantSend or map) on successful
+// credit and consulted by both at the start of processing to prevent
+// double-credit. Two distinct values let us tell the paths apart and keep
+// the IS-locked-then-block-confirms flow correctly idempotent:
+//
+//   - ISLockedMarkerPending   = "1" — set by mapInstantSend before the
+//     tx has confirmed in a block. The IS-lock proves finality, oracle
+//     consensus gates the credit, but no block proof exists yet.
+//   - ISLockedMarkerConfirmed = "2" — set by HandleMap on successful
+//     credit, OR written by HandleMap as an upgrade of a pre-existing
+//     "1" marker when the IS-locked tx finally confirms (no second
+//     credit issued in that case).
+//
+// HandleMap accepts an absent marker (normal flow → set "2") or any
+// non-empty marker (already credited → idempotent no-op). HandleMapInstantSend
+// only accepts an absent marker; any non-empty value aborts.
 //
 // IS-locked deposits are credited solely on oracle consensus — the contract
 // does not verify the LLMQ BLS signature itself, the same trust model that
 // already applies to Dash block-header acceptance (X11 PoW skipped).
 const ISLockedClaimedPrefix = "il" + DirPathDelimiter
+
+const (
+	ISLockedMarkerPending   = "1"
+	ISLockedMarkerConfirmed = "2"
+)
 
 // MaxBaseFeeRate caps the base fee rate at 500 duffs/vbyte.
 // Pentest finding BTC-C6 (propagated from btc-mapping-contract): the

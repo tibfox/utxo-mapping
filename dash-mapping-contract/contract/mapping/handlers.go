@@ -30,18 +30,29 @@ func (ms *MappingState) HandleMap(txData *VerificationRequest) error {
 		return ce.WrapContractError(ce.ErrInput, err, "could not construct BTC transaction from input")
 	}
 
-	// If this tx was already credited via the InstantSend fast path
-	// (mapInstantSend), don't double-credit. Just clear the marker so the
-	// state entry doesn't linger forever.
 	txID := msgTx.TxID()
 	ilKey := constants.ISLockedClaimedPrefix + txID
-	if claimed := sdk.StateGetObject(ilKey); claimed != nil && *claimed == "1" {
-		sdk.StateDeleteObject(ilKey)
-		// Still remove from utxo spends to keep that registry consistent.
-		if err := ms.updateUtxoSpends(txID); err != nil {
-			return ce.Prepend(err, "error updating utxo spends after IS-locked claim")
+
+	// Consult the ISLockedClaimed marker. Both actions write it on
+	// successful credit; either value short-circuits HandleMap so we never
+	// double-credit, regardless of which path ran first.
+	if marker := sdk.StateGetObject(ilKey); marker != nil && *marker != "" {
+		switch *marker {
+		case constants.ISLockedMarkerPending:
+			// IS-locked credit already issued; this is the block-confirmation
+			// pass. Upgrade marker to "confirmed" and reconcile utxo spends.
+			sdk.StateSetObject(ilKey, constants.ISLockedMarkerConfirmed)
+			if err := ms.updateUtxoSpends(txID); err != nil {
+				return ce.Prepend(err, "error updating utxo spends after IS-locked claim")
+			}
+			return nil
+		case constants.ISLockedMarkerConfirmed:
+			// Already fully processed — idempotent retry.
+			return nil
+		default:
+			// Unknown marker value; treat as already credited (defensive).
+			return nil
 		}
-		return nil
 	}
 
 	// gets all outputs the address of which is specified in the deposit instructions
@@ -60,6 +71,12 @@ func (ms *MappingState) HandleMap(txData *VerificationRequest) error {
 	if err != nil {
 		return err
 	}
+
+	// Mark this tx as credited (block-confirmed). Acts as the defensive guard
+	// against a stale rawtxlock event that arrives after the block has
+	// already been processed: HandleMapInstantSend's marker check then
+	// aborts that out-of-order call.
+	sdk.StateSetObject(ilKey, constants.ISLockedMarkerConfirmed)
 
 	return nil
 }
@@ -89,8 +106,13 @@ func (ms *MappingState) HandleMapInstantSend(rawTxHex string) error {
 
 	txID := msgTx.TxID()
 	ilKey := constants.ISLockedClaimedPrefix + txID
-	if existing := sdk.StateGetObject(ilKey); existing != nil && *existing == "1" {
-		return ce.NewContractError(ce.ErrTransaction, "tx already claimed via mapInstantSend: "+txID)
+
+	// Marker present (with any value) → already credited via this path or
+	// the block-confirmed path. Strict abort prevents double-credit even
+	// when ordering inverts (block confirms first, stale rawtxlock arrives
+	// second).
+	if existing := sdk.StateGetObject(ilKey); existing != nil && *existing != "" {
+		return ce.NewContractError(ce.ErrTransaction, "tx already credited (marker="+*existing+"): "+txID)
 	}
 
 	relevantOutputs, err := ms.indexOutputs(&msgTx)
@@ -110,7 +132,7 @@ func (ms *MappingState) HandleMapInstantSend(rawTxHex string) error {
 		return err
 	}
 
-	sdk.StateSetObject(ilKey, "1")
+	sdk.StateSetObject(ilKey, constants.ISLockedMarkerPending)
 	return nil
 }
 
