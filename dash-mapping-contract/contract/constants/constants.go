@@ -90,6 +90,20 @@ const BackupPublicKeyStateKey = "backupkey"
 
 const BlockPrefix = "b" + DirPathDelimiter
 
+// ISLockedClaimedPrefix marks deposit txs that have already been credited via
+// the InstantSend fast path (mapInstantSend action). Key: "il-<txid>",
+// value: "1" when claimed.
+//
+// Purpose: prevent double-credit when an IS-locked deposit later lands in a
+// block. The bot will submit the same tx through the normal `map` action
+// once the block confirms; HandleMap consults this set first and short-
+// circuits if the marker is present (then clears it).
+//
+// IS-locked deposits are credited solely on oracle consensus — the contract
+// does not verify the LLMQ BLS signature itself, the same trust model that
+// already applies to Dash block-header acceptance (X11 PoW skipped).
+const ISLockedClaimedPrefix = "il" + DirPathDelimiter
+
 // MaxBaseFeeRate caps the base fee rate at 500 duffs/vbyte.
 // Pentest finding BTC-C6 (propagated from btc-mapping-contract): the
 // previous 1000 sat/vbyte ceiling only protected against int overflow

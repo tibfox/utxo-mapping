@@ -30,6 +30,20 @@ func (ms *MappingState) HandleMap(txData *VerificationRequest) error {
 		return ce.WrapContractError(ce.ErrInput, err, "could not construct BTC transaction from input")
 	}
 
+	// If this tx was already credited via the InstantSend fast path
+	// (mapInstantSend), don't double-credit. Just clear the marker so the
+	// state entry doesn't linger forever.
+	txID := msgTx.TxID()
+	ilKey := constants.ISLockedClaimedPrefix + txID
+	if claimed := sdk.StateGetObject(ilKey); claimed != nil && *claimed == "1" {
+		sdk.StateDeleteObject(ilKey)
+		// Still remove from utxo spends to keep that registry consistent.
+		if err := ms.updateUtxoSpends(txID); err != nil {
+			return ce.Prepend(err, "error updating utxo spends after IS-locked claim")
+		}
+		return nil
+	}
+
 	// gets all outputs the address of which is specified in the deposit instructions
 	relevantOutputs, err := ms.indexOutputs(&msgTx)
 	if err != nil {
@@ -37,7 +51,7 @@ func (ms *MappingState) HandleMap(txData *VerificationRequest) error {
 	}
 
 	// removes this tx from utxo spends if present
-	if err := ms.updateUtxoSpends(msgTx.TxID()); err != nil {
+	if err := ms.updateUtxoSpends(txID); err != nil {
 		return ce.Prepend(err, "error updating utxo spends")
 	}
 
@@ -47,6 +61,56 @@ func (ms *MappingState) HandleMap(txData *VerificationRequest) error {
 		return err
 	}
 
+	return nil
+}
+
+// HandleMapInstantSend credits a depositor for a Dash InstantSend-locked tx
+// that is not yet in a block. The oracle layer's 2/3+ BLS attestation
+// provides the trust guarantee — the same model that already gates Dash
+// block-header acceptance (X11 PoW is not verified at the contract level).
+//
+// Idempotency: the txid is recorded under ISLockedClaimedPrefix. When the
+// same tx later lands in a block and HandleMap is invoked, it consults the
+// marker and short-circuits, preventing double-credit.
+//
+// Reuses processUtxos with blockHeight=0 so the observed-list per-block
+// dedup mechanism still applies within the IS-locked bucket (defending
+// against repeated mapInstantSend calls with the same tx mid-flight).
+func (ms *MappingState) HandleMapInstantSend(rawTxHex string) error {
+	rawTx, err := hex.DecodeString(rawTxHex)
+	if err != nil {
+		return ce.WrapContractError(ce.ErrInvalidHex, err, "error decoding raw transaction hex")
+	}
+
+	var msgTx wire.MsgTx
+	if err := msgTx.Deserialize(bytes.NewReader(rawTx)); err != nil {
+		return ce.WrapContractError(ce.ErrInput, err, "could not construct DASH transaction from input")
+	}
+
+	txID := msgTx.TxID()
+	ilKey := constants.ISLockedClaimedPrefix + txID
+	if existing := sdk.StateGetObject(ilKey); existing != nil && *existing == "1" {
+		return ce.NewContractError(ce.ErrTransaction, "tx already claimed via mapInstantSend: "+txID)
+	}
+
+	relevantOutputs, err := ms.indexOutputs(&msgTx)
+	if err != nil {
+		return ce.Prepend(err, "error indexing outputs")
+	}
+
+	if err := ms.updateUtxoSpends(txID); err != nil {
+		return ce.Prepend(err, "error updating utxo spends")
+	}
+
+	// blockHeight=0 is the "IS-locked, pending block confirmation" bucket;
+	// the per-block observed-list at height 0 prevents re-processing the
+	// same tx if mapInstantSend is invoked twice (independent of the
+	// ISLockedClaimed marker, which is the outer dedup against HandleMap).
+	if err := ms.processUtxos(relevantOutputs, senderLabel(msgTx.TxIn, ms.NetworkParams), 0); err != nil {
+		return err
+	}
+
+	sdk.StateSetObject(ilKey, "1")
 	return nil
 }
 

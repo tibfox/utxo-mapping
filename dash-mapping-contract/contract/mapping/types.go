@@ -13,6 +13,17 @@ type MapParams struct {
 	Instructions []string `json:"instructions"`
 }
 
+// MapInstantSendParams carries the inputs for crediting a deposit on the
+// strength of an InstantSend LLMQ lock alone — no block proof. The oracle
+// layer's 2/3+ BLS attestation gates the call; the contract does not
+// re-verify the IS-lock signature itself.
+//
+//tinyjson:json
+type MapInstantSendParams struct {
+	RawTxHex     string   `json:"raw_tx_hex"`
+	Instructions []string `json:"instructions"`
+}
+
 //tinyjson:json
 type VerificationRequest struct {
 	BlockHeight    uint32 `json:"block_height"`

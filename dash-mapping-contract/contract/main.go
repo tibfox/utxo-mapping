@@ -288,6 +288,47 @@ func Map(incomingTx *string) *string {
 	return mapping.StrPtr("0")
 }
 
+// MapInstantSend credits a depositor for an InstantSend-locked Dash tx that
+// has not yet been included in a block. Oracle-only — the LLMQ BLS sig is
+// validated upstream by oracle consensus (2/3+ BLS attestations), the same
+// trust model as block-header acceptance for Dash (X11 PoW is not
+// verified by the contract).
+//
+// Idempotent with the normal `map` action: the txid is recorded in
+// ISLockedClaimedPrefix; when `map` is later called for the same tx after
+// the block confirms, it sees the marker, clears it, and skips re-crediting.
+//
+//go:wasmexport mapInstantSend
+func MapInstantSend(incomingTx *string) *string {
+	checkOracle()
+	checkNotPaused()
+
+	var params mapping.MapInstantSendParams
+	if err := tinyjson.Unmarshal([]byte(*incomingTx), &params); err != nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, err.Error(), ce.MsgBadInput))
+	}
+
+	publicKeys, err := loadPublicKeys()
+	if err != nil {
+		ce.CustomAbort(err)
+	}
+
+	contractState, err := mapping.InitializeMappingState(publicKeys, NetworkMode, params.Instructions...)
+	if err != nil {
+		ce.CustomAbort(err)
+	}
+
+	if err := contractState.HandleMapInstantSend(params.RawTxHex); err != nil {
+		ce.CustomAbort(err)
+	}
+
+	if err := contractState.SaveToState(); err != nil {
+		ce.CustomAbort(err)
+	}
+
+	return mapping.StrPtr("0")
+}
+
 // Withdraws BTC from the caller's own balance to a Bitcoin address.
 // The `from` field is ignored — unmaps always draw from the caller's balance.
 //
