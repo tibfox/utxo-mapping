@@ -7,7 +7,7 @@ import (
 )
 
 // AddressWithBackup derives the P2WSH address for the given keys and tag.
-// Tag semantics match createP2WSHAddressWithBackup:
+// Tag semantics match createP2SHAddressWithBackup:
 //   - nil  → OP_CHECKSIGVERIFY + OP_DATA_0 (change address path)
 //   - []byte{} → OP_CHECKSIG only (empty-tag UTXO)
 //   - non-empty → OP_CHECKSIGVERIFY + <tag>
@@ -24,7 +24,7 @@ func AddressWithBackup(
 	if err != nil {
 		return "", nil, err
 	}
-	return createP2WSHAddressWithBackup(primaryPubKey, backupPubKey, tag, network)
+	return createP2SHAddressWithBackup(primaryPubKey, backupPubKey, tag, network)
 }
 
 // DepositAddress derives the P2WSH deposit address for a given instruction string.
@@ -42,5 +42,5 @@ func DepositAddress(
 		return "", nil, err
 	}
 	sum := sha256.Sum256([]byte(instruction))
-	return createP2WSHAddressWithBackup(primaryPubKey, backupPubKey, sum[:], network)
+	return createP2SHAddressWithBackup(primaryPubKey, backupPubKey, sum[:], network)
 }

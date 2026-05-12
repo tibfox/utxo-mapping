@@ -25,8 +25,15 @@ const (
 	TestBackupPubKeyHex  = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
 )
 
+// regtestParams returns regtest params with Dash address-version overrides
+// matching contract/mapping/init.go::dashRegTestParams. We need the same
+// ScriptHashAddrID on both sides so that P2SH deposit addresses round-trip
+// between the on-chain validation and these test helpers.
 func regtestParams() *chaincfg.Params {
-	return &chaincfg.RegressionNetParams
+	p := chaincfg.RegressionNetParams
+	p.PubKeyHashAddrID = 0x8c
+	p.ScriptHashAddrID = 0x13
+	return &p
 }
 
 // encodeBalance encodes amount using the same compact big-endian binary

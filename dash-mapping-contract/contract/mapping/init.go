@@ -178,7 +178,7 @@ func (cs *ContractState) parseInstructions(
 			hasher := sha256.New()
 			hasher.Write([]byte(instr))
 			hashBytes := hasher.Sum(nil)
-			address, _, err := createP2WSHAddressWithBackup(
+			address, _, err := createP2SHAddressWithBackup(
 				publicKeys.Primary,
 				publicKeys.Backup,
 				hashBytes,

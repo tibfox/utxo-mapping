@@ -4,7 +4,6 @@ import (
 	"dash-mapping-contract/contract/constants"
 	ce "dash-mapping-contract/contract/contracterrors"
 	"dash-mapping-contract/sdk"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -20,7 +19,24 @@ import (
 	"github.com/btcsuite/btcd/wire"
 )
 
-func createP2WSHAddressWithBackup(
+// createP2SHAddressWithBackup builds a P2SH deposit address (base58 7…/8…/9…
+// depending on network) embedding a primary+backup spend script.
+//
+// Why P2SH and not P2WSH like BTC? Dash Core never adopted SegWit — its
+// address parser actively rejects bech32 (any "Invalid Dash address" path),
+// the JSON-RPC `sendtoaddress` and `createrawtransaction` won't accept
+// bech32 destinations, and even raw P2WSH outputs are classified as
+// `nonstandard` in `decodescript`. The only way to make this contract
+// usable from real Dash wallets is to encode the deposit address as P2SH,
+// which Dash has supported since v0.10.
+//
+// The redeem script is the same primary/backup-with-CSV multi-path script
+// btc-mapping-contract uses inside its P2WSH — only the wrapping changes.
+// Spending still uses the redeem script on the scriptSig side instead of
+// the witness (BIP143 → BIP16 sighash). Unmap/confirmSpend signing paths
+// will need to be reworked to match before withdrawals can ship; deposit
+// credit works today.
+func createP2SHAddressWithBackup(
 	primaryPubKey CompressedPubKey, backupPubKey CompressedPubKey, tag []byte, network *chaincfg.Params,
 ) (string, []byte, error) {
 	csvBlocks := constants.BackupCSVBlocks
@@ -59,30 +75,30 @@ func createP2WSHAddressWithBackup(
 	// end if
 	scriptBuilder.AddOp(txscript.OP_ENDIF)
 
-	script, err := scriptBuilder.Script()
+	redeemScript, err := scriptBuilder.Script()
 	if err != nil {
 		return "", nil, err
 	}
 
-	witnessProgram := sha256.Sum256(script)
-	addressWitnessScriptHash, err := btcutil.NewAddressWitnessScriptHash(witnessProgram[:], network)
+	// HASH160(redeemScript) → P2SH address using network.ScriptHashAddrID.
+	addressScriptHash, err := btcutil.NewAddressScriptHash(redeemScript, network)
 	if err != nil {
 		return "", nil, err
 	}
 
-	return addressWitnessScriptHash.EncodeAddress(), script, nil
+	return addressScriptHash.EncodeAddress(), redeemScript, nil
 }
 
-func createP2WSHAddress(pubKeyHex string, tag []byte, network *chaincfg.Params) (string, []byte, error) {
+func createP2SHAddress(pubKeyHex string, tag []byte, network *chaincfg.Params) (string, []byte, error) {
 	pubKeyBytes, err := hex.DecodeString(pubKeyHex)
 	if err != nil {
 		return "", nil, err
 	}
 
-	return createSimpleP2WSHAddress(pubKeyBytes, tag, network)
+	return createSimpleP2SHAddress(pubKeyBytes, tag, network)
 }
 
-func createSimpleP2WSHAddress(pubKeyBytes []byte, tag []byte, network *chaincfg.Params) (string, []byte, error) {
+func createSimpleP2SHAddress(pubKeyBytes []byte, tag []byte, network *chaincfg.Params) (string, []byte, error) {
 	scriptBuilder := txscript.NewScriptBuilder()
 	if len(tag) > 0 {
 		scriptBuilder.AddData(pubKeyBytes)
@@ -93,17 +109,16 @@ func createSimpleP2WSHAddress(pubKeyBytes []byte, tag []byte, network *chaincfg.
 		scriptBuilder.AddOp(txscript.OP_CHECKSIG)
 	}
 
-	script, err := scriptBuilder.Script()
+	redeemScript, err := scriptBuilder.Script()
 	if err != nil {
 		return "", nil, err
 	}
 
-	witnessProgram := sha256.Sum256(script)
-	addressWitnessScriptHash, err := btcutil.NewAddressWitnessScriptHash(witnessProgram[:], network)
+	addressScriptHash, err := btcutil.NewAddressScriptHash(redeemScript, network)
 	if err != nil {
 		return "", nil, err
 	}
-	return addressWitnessScriptHash.EncodeAddress(), script, nil
+	return addressScriptHash.EncodeAddress(), redeemScript, nil
 }
 
 func checkAuth(env sdk.Env) error {

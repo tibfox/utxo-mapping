@@ -252,7 +252,7 @@ func (cs *ContractState) buildSpendTransaction(
 		txIn := wire.NewTxIn(outPoint, nil, nil)
 		tx.AddTxIn(txIn)
 
-		_, witnessScript, err := createP2WSHAddressWithBackup(
+		_, witnessScript, err := createP2SHAddressWithBackup(
 			cs.PublicKeys.Primary,
 			cs.PublicKeys.Backup,
 			utxo.Tag, // already []byte
