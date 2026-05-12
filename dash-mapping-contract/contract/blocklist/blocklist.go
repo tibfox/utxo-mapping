@@ -110,10 +110,30 @@ func HandleAddBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uint32,
 		return 0, ce.NewContractError(ce.ErrInput, "error decoding block header: "+err.Error())
 	}
 
-	// Dash uses X11 for PoW which is not available in btcsuite, so we skip
-	// the PoW check here. Header integrity is enforced by the oracle before
-	// addBlocks is called; here we only validate decodability and chain
-	// linkage by PrevBlock hash.
+	// Trust model for Dash (single-layer, team-decided):
+	//
+	// Dash uses X11 for both PoW and block-hash chaining. btcsuite's
+	// wire.BlockHeader.BlockHash() computes SHA256d — correct for Bitcoin,
+	// wrong for Dash. Implementing X11 in TinyGo WASM is a multi-week
+	// project for a marginal security gain over what oracle BLS consensus
+	// already provides, so we skip the on-chain chain-linkage check in
+	// the same spirit as the audit-accepted PoW skip (H-01).
+	//
+	// Concretely this means addBlocks trusts the 2/3+ BLS oracle quorum
+	// to attest that the submitted headers are:
+	//   - well-formed (we still decode each one),
+	//   - sequential (no on-chain PrevBlock check),
+	//   - non-reorganized (reorg handling moves entirely off-chain — the
+	//     oracle is expected to detect and recover via replaceBlock /
+	//     replaceBlocks if a Dash reorg occurs).
+	//
+	// This matches the trust model already in production for LTC/DOGE/BCH
+	// per H-01 (oracle attestation is the security boundary for any chain
+	// whose crypto isn't natively available to btcsuite). Lifting Dash to
+	// a two-layer model would require implementing X11 in TinyGo or
+	// extending the addBlocks payload with an oracle-provided hash; both
+	// are tracked as follow-ups but not load-bearing.
+	_ = lastBlockHeader // kept as a parameter for future X11-based linkage
 	for _, headerBytes := range rawHeaders {
 		// won't happen for 130 years but just in case
 		if lastHeight == math.MaxUint32 {
@@ -127,10 +147,7 @@ func HandleAddBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uint32,
 			return 0, ce.NewContractError(ce.ErrInput, "error decoding block header: "+err.Error())
 		}
 
-		lastBlockHash := lastBlockHeader.BlockHash()
-		if !blockHeader.PrevBlock.IsEqual(&lastBlockHash) {
-			return 0, ce.NewContractError(ce.ErrInput, "block sequence incorrect")
-		}
+		// Chain-linkage check intentionally omitted — see comment above.
 
 		// store raw 80 bytes (not hex)
 		sdk.StateSetObject(
@@ -138,7 +155,7 @@ func HandleAddBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uint32,
 			string(headerBytes[:]),
 		)
 		lastHeight = blockHeight
-		lastBlockHeader = blockHeader
+		_ = blockHeader // kept for future X11-based linkage; not used today
 	}
 
 	PruneOldHeaders(lastHeight)

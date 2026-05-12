@@ -128,11 +128,17 @@ func TestAllOperations(t *testing.T) {
 		assert.False(t, r.Success, "addBlocks with 81-byte block should fail")
 	})
 
-	t.Run("AddBlocks_WrongSequenceFails", func(t *testing.T) {
+	// Dash trust-model note (extension of audit finding H-01):
+	// The mapping contract cannot verify Dash's chain-linkage on-chain because
+	// Dash uses X11 (not SHA256d) for block hashing, and no X11 implementation
+	// is available in TinyGo / btcsuite. Sequentiality is enforced by the 2/3+
+	// BLS oracle quorum that gates addBlocks. The contract therefore accepts
+	// any well-formed 80-byte header and trusts the oracle's attestation.
+	t.Run("AddBlocks_WrongSequenceAccepted_DashTrustsOracle", func(t *testing.T) {
 		seedBlocksViaState(w)
 		fakeBlock := strings.Repeat("00", 80)
 		r := callAction(t, w, "addBlocks", `{"blocks":"`+fakeBlock+`","latest_fee":1}`, "")
-		assert.False(t, r.Success, "addBlocks with wrong prev-block sequence should fail")
+		assert.True(t, r.Success, "addBlocks accepts any well-formed header — oracle attests sequentiality: %s %s", r.Err, r.ErrMsg)
 	})
 
 	t.Run("AddBlocks_EmptyBlocksNoOp", func(t *testing.T) {
