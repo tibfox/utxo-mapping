@@ -197,8 +197,16 @@ func PruneOldHeaders(lastHeight uint32) int {
 
 // HandleReplaceBlock replaces the block at the current tip height with a
 // corrected header. This is used to fix a stale/orphaned tip that prevents
-// new blocks from being appended. The replacement must chain correctly to
-// the block at height-1. PoW is not checked (Dash uses X11).
+// new blocks from being appended. PoW is not checked (Dash uses X11).
+//
+// Chain-linkage check intentionally omitted — same single-layer trust model
+// that HandleAddBlocks already uses (audit H-01 extension): btcsuite's
+// wire.BlockHeader.BlockHash() computes SHA256d, which is the wrong
+// algorithm for Dash (X11), so any local PrevBlock.IsEqual chaining check
+// would always fail for legitimate replacement headers. Sequentiality is
+// enforced by the 2/3+ BLS oracle quorum that gates replaceBlock; the
+// contract accepts any well-formed 80-byte header and trusts the oracle's
+// attestation.
 func HandleReplaceBlock(rawHeader BlockHeaderBytes, networkMode string) (uint32, error) {
 	_ = networkMode // Dash skips PoW (X11 unavailable in btcsuite); kept for signature compat
 
@@ -210,28 +218,14 @@ func HandleReplaceBlock(rawHeader BlockHeaderBytes, networkMode string) (uint32,
 		return 0, ce.NewContractError(ce.ErrInput, "cannot replace block at height 0 (no previous block to chain to)")
 	}
 
-	// decode the replacement header
+	// decode the replacement header (well-formedness check; result not used
+	// because chain-linkage validation is delegated to the oracle quorum)
 	var newHeader wire.BlockHeader
 	err = newHeader.BtcDecode(bytes.NewReader(rawHeader[:]), wire.ProtocolVersion, wire.LatestEncoding)
 	if err != nil {
 		return 0, ce.NewContractError(ce.ErrInput, "error decoding replacement header: "+err.Error())
 	}
-
-	// validate that the replacement chains to height-1
-	prevHeight := lastHeight - 1
-	prevBlockRaw := sdk.StateGetObject(constants.BlockPrefix + strconv.FormatUint(uint64(prevHeight), 10))
-	if prevBlockRaw == nil || *prevBlockRaw == "" {
-		return 0, ce.NewContractError(ce.ErrStateAccess, "no block found at height "+strconv.FormatUint(uint64(prevHeight), 10))
-	}
-	var prevHeader wire.BlockHeader
-	err = prevHeader.BtcDecode(bytes.NewReader([]byte(*prevBlockRaw)), wire.ProtocolVersion, wire.LatestEncoding)
-	if err != nil {
-		return 0, ce.NewContractError(ce.ErrStateAccess, "error decoding block at height "+strconv.FormatUint(uint64(prevHeight), 10))
-	}
-	prevHash := prevHeader.BlockHash()
-	if !newHeader.PrevBlock.IsEqual(&prevHash) {
-		return 0, ce.NewContractError(ce.ErrInput, "replacement block does not chain to block at height "+strconv.FormatUint(uint64(prevHeight), 10))
-	}
+	_ = newHeader
 
 	// overwrite the tip
 	sdk.StateSetObject(
@@ -258,6 +252,13 @@ func HandleReplaceBlock(rawHeader BlockHeaderBytes, networkMode string) (uint32,
 // The headers slice must be ordered lowest-to-highest (oldest first), matching
 // addBlocks ordering. The first header replaces lastHeight-(N-1), the last
 // header replaces lastHeight. PoW is not checked (Dash uses X11).
+//
+// Chain-linkage check intentionally omitted — same single-layer trust
+// model HandleAddBlocks / HandleReplaceBlock use: btcsuite's
+// wire.BlockHeader.BlockHash() is SHA256d, the wrong algorithm for Dash
+// (X11), so a local PrevBlock.IsEqual check would reject legitimate
+// reorg payloads. The oracle's 2/3+ BLS attestation is the sequentiality
+// guarantee; the contract validates well-formedness only.
 func HandleReplaceBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uint32, error) {
 	if len(rawHeaders) == 0 {
 		return 0, ce.NewContractError(ce.ErrInput, "no replacement headers provided")
@@ -283,20 +284,14 @@ func HandleReplaceBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uin
 		return 0, ce.NewContractError(ce.ErrInput, "more replacement headers than stored blocks")
 	}
 
-	// The anchor is the block just below the reorg range that must remain valid.
+	// Anchor height is the block just below the reorg range. We don't read
+	// the anchor's header anymore (no chain-linkage check), but we still
+	// derive the height so each replacement lands at the right slot.
 	anchorHeight := lastHeight - n
-	anchorBlockRaw := sdk.StateGetObject(constants.BlockPrefix + strconv.FormatUint(uint64(anchorHeight), 10))
-	if anchorBlockRaw == nil || *anchorBlockRaw == "" {
-		return 0, ce.NewContractError(ce.ErrStateAccess, "no block found at anchor height "+strconv.FormatUint(uint64(anchorHeight), 10))
-	}
-	var anchorHeader wire.BlockHeader
-	err = anchorHeader.BtcDecode(bytes.NewReader([]byte(*anchorBlockRaw)), wire.ProtocolVersion, wire.LatestEncoding)
-	if err != nil {
-		return 0, ce.NewContractError(ce.ErrStateAccess, "error decoding block at anchor height "+strconv.FormatUint(uint64(anchorHeight), 10))
-	}
-	prevHash := anchorHeader.BlockHash()
 
-	// Validate and overwrite each header in order.
+	// Decode + overwrite each header in order. Decoding is kept as a
+	// well-formedness gate; the chain-linkage assertion that used to live
+	// in this loop is now an oracle responsibility.
 	for i, headerBytes := range rawHeaders {
 		height := anchorHeight + 1 + uint32(i)
 
@@ -305,11 +300,7 @@ func HandleReplaceBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uin
 		if err != nil {
 			return 0, ce.NewContractError(ce.ErrInput, "error decoding replacement header at index "+strconv.Itoa(i))
 		}
-
-		if !hdr.PrevBlock.IsEqual(&prevHash) {
-			return 0, ce.NewContractError(ce.ErrInput,
-				"replacement block at height "+strconv.FormatUint(uint64(height), 10)+" does not chain to block at height "+strconv.FormatUint(uint64(height-1), 10))
-		}
+		_ = hdr
 
 		sdk.StateSetObject(
 			constants.BlockPrefix+strconv.FormatUint(uint64(height), 10),
@@ -320,7 +311,6 @@ func HandleReplaceBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uin
 		sdk.StateDeleteObject(
 			constants.ObservedBlockPrefix + strconv.FormatUint(uint64(height), 10),
 		)
-		prevHash = hdr.BlockHash()
 	}
 
 	return lastHeight, nil
