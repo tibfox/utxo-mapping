@@ -53,10 +53,18 @@ func getInputUtxos(registryEntries []uint16) ([]*Utxo, error) {
 	return result, nil
 }
 
-// estimateVSize returns the estimated vSize for given non-witness and witness data sizes.
-func estimateVSize(nonWitnessSize, witnessDataSize int64) int64 {
-	totalSize := nonWitnessSize + witnessDataSize
-	return (nonWitnessSize*3+totalSize+3)/4 + 2
+// estimateP2SHTxSize returns the estimated serialized tx size with all
+// inputs' P2SH scriptSigs filled in. Dash never adopted SegWit, so there
+// is no vSize discount — fee math is just totalSize × feeRate.
+//
+// Per-input scriptSig overhead:
+//   - sig + sighash byte: 1 + 72 + 1 = 74 (worst-case DER signature)
+//   - branch_selector push: 1 + 1 = 2
+//   - redeem_script push: 2 (OP_PUSHDATA1 + length) + len(redeemScript)
+//
+// scriptSigPerInput = 78 + len(redeemScript).
+func estimateP2SHTxSize(baseSize, scriptSigDataSize int64) int64 {
+	return baseSize + scriptSigDataSize
 }
 
 // clampedFeeRate returns the base fee rate clamped to MaxBaseFeeRate.
@@ -73,27 +81,35 @@ func clampedFeeRate(rate int64) int64 {
 // Helper function to estimate fee for a given number of inputs and outputs.
 // Accounts for the base fee before deciding how many change outputs to include,
 // and only adds change outputs that remain above dust after fee adjustment.
+//
+// Dash spends are P2SH (no SegWit), so the scriptSig sits inside the input
+// serialization itself — there is no vSize discount. Fee = totalSize × rate.
 func (cs *ContractState) estimateFee(numInputs int64, amount, inputAmount int64) (int64, error) {
 	feeRate := clampedFeeRate(cs.Supply.BaseFeeRate)
 	totalChange := inputAmount - amount
 
 	// Base transaction overhead (version, locktime, etc.)
 	baseSize := int64(10)
-	// Input size: outpoint (36) + script sig length (1) + sequence (4)
+	// Input bare size: outpoint (36) + scriptSig length varint (1, jumps to 3
+	// once filled) + sequence (4). scriptSig itself is added below.
 	inputSize := numInputs * 41
-	// Output size: value (8) + script length (1) + P2WSH script (34)
+	// Output size: value (8) + script length (1) + P2PKH-or-P2SH script (~25-34)
 	outputSize := int64(43) // 1 destination output
 
-	// Witness stack per input: <sig> <branch_selector> <witness_script>
-	// Serialized: item_count(1) + sig_len(1) + sig(72) + branch_len(1) + branch(1) + script_len(1) + script(N)
-	// Witness script is ~79 bytes for change UTXOs (no tag) or ~112 bytes for
-	// deposit UTXOs (with 32-byte tag). Use 112 as conservative upper bound
-	// to ensure fee estimate >= actual fee from calculateSegwitFee.
-	witnessDataSize := numInputs * (72 + 112 + 5)
+	// Per-input scriptSig (filled): push(sig+hashtype=74) + push(branch=2) +
+	// push(redeem_script). Redeem script is ~79 bytes for change UTXOs (no
+	// tag) or ~112 bytes for deposit UTXOs (with 32-byte tag). Use 112 as
+	// the conservative upper bound so the fee estimate >= the actual fee
+	// from calculateP2SHFee. The OP_PUSHDATA1 prefix adds 2 bytes for a
+	// ~112-byte push, so scriptSig data size ≈ 74 + 2 + 2 + 112 = 190.
+	// Plus 2 extra bytes when the scriptSig length varint widens from 1
+	// to 3 once it crosses 252 (it doesn't at 190 per input, but we add a
+	// small cushion).
+	scriptSigDataSize := numInputs * 192
 
 	// Compute base fee (no change outputs) first
-	nonWitnessSize := baseSize + inputSize + outputSize
-	baseFee, err := safeMultiply64(estimateVSize(nonWitnessSize, witnessDataSize), feeRate)
+	txSize := baseSize + inputSize + outputSize
+	baseFee, err := safeMultiply64(estimateP2SHTxSize(txSize, scriptSigDataSize), feeRate)
 	if err != nil {
 		return 0, ce.WrapContractError(ce.ErrArithmetic, err, "fee estimation overflow")
 	}
@@ -109,8 +125,8 @@ func (cs *ContractState) estimateFee(numInputs int64, amount, inputAmount int64)
 		// Add change outputs one at a time, stopping when per-output amount is dust
 		addedOutputs := int64(0)
 		for i := int64(0); i < numChangeOutputs; i++ {
-			newNonWitness := nonWitnessSize + (addedOutputs+1)*43
-			newFee, err := safeMultiply64(estimateVSize(newNonWitness, witnessDataSize), feeRate)
+			newTxSize := txSize + (addedOutputs+1)*43
+			newFee, err := safeMultiply64(estimateP2SHTxSize(newTxSize, scriptSigDataSize), feeRate)
 			if err != nil {
 				return 0, ce.WrapContractError(ce.ErrArithmetic, err, "fee estimation overflow")
 			}
@@ -122,11 +138,11 @@ func (cs *ContractState) estimateFee(numInputs int64, amount, inputAmount int64)
 				break
 			}
 			addedOutputs++
-			nonWitnessSize = newNonWitness
+			txSize = newTxSize
 		}
 	}
 
-	fee, err := safeMultiply64(estimateVSize(nonWitnessSize, witnessDataSize), feeRate)
+	fee, err := safeMultiply64(estimateP2SHTxSize(txSize, scriptSigDataSize), feeRate)
 	if err != nil {
 		return 0, ce.WrapContractError(ce.ErrArithmetic, err, "fee estimation overflow")
 	}
@@ -210,27 +226,38 @@ func (cs *ContractState) getInputUtxoIds(amount int64) ([]uint16, int64, error) 
 	return nil, 0, ce.NewContractError(ce.ErrBalance, "total available balance insufficient to complete transaction")
 }
 
-func (cs *ContractState) calculateSegwitFee(baseSize int64, witnessScripts map[int][]byte) (int64, error) {
+// calculateP2SHFee computes the miner fee for a P2SH-spending tx. Each
+// input's scriptSig is `push(sig+hashtype) || push(branch_selector) ||
+// push(redeem_script)`, all of which counts toward the tx's serialized
+// size — Dash has no SegWit-style witness discount.
+func (cs *ContractState) calculateP2SHFee(baseSize int64, redeemScripts map[int][]byte) (int64, error) {
 	feeRate := clampedFeeRate(cs.Supply.BaseFeeRate)
-	// Witness stack per input: <sig> <branch_selector> <witness_script>
-	// Serialized: item_count(1) + sig_len(1) + sig(72) + branch_len(1) + branch(1) + script_len(1) + script(N)
-	witnessDataSize := int64(0)
-	for _, witnessScript := range witnessScripts {
-		witnessDataSize += 72 + int64(len(witnessScript)) + 5
+	// Per input:
+	//   push(sig+sighashtype): 1 opcode + 73 bytes = 74
+	//   push(branch_selector): 1 opcode + 1 byte    = 2
+	//   push(redeem_script):   2 (OP_PUSHDATA1+len) + len(script)
+	// scriptSig length varint also grows from 1 byte (empty) to typically
+	// 1 byte (≤252) → no varint adjustment needed for our 190ish scriptSigs.
+	scriptSigDataSize := int64(0)
+	for _, redeemScript := range redeemScripts {
+		scriptSigDataSize += 74 + 2 + 2 + int64(len(redeemScript))
 	}
-	totalSize := baseSize + witnessDataSize
-	// +3 to round up, + 2 for has witness data flag
-	vSize := (baseSize*3+totalSize+3)/4 + 2
-	fee, err := safeMultiply64(vSize, feeRate)
+	totalSize := baseSize + scriptSigDataSize
+	fee, err := safeMultiply64(totalSize, feeRate)
 	if err != nil {
 		return 0, ce.WrapContractError(ce.ErrArithmetic, err, "fee calculation overflow")
 	}
 	return fee, nil
 }
 
-// buildSpendTransaction constructs the Bitcoin withdrawal transaction and
+// buildSpendTransaction constructs the Dash withdrawal transaction and
 // computes the miner fee, but does NOT request TSS signing. Call
 // signSpendTransaction after all validation checks pass.
+//
+// The returned map is the redeem-script-per-input (P2SH spending), not
+// a witness script — Dash never adopted SegWit. The map's downstream
+// users (signSpendTransaction, the bot's attachSignatures) treat it as
+// raw bytes to embed in the scriptSig push sequence.
 func (cs *ContractState) buildSpendTransaction(
 	inputs []*Utxo,
 	totalInputsAmount int64,
@@ -240,8 +267,9 @@ func (cs *ContractState) buildSpendTransaction(
 ) (*wire.MsgTx, map[int][]byte, int64, error) {
 	tx := wire.NewMsgTx(wire.TxVersion)
 
-	// create all witness scripts now for better size estimation
-	witnessScripts := make(map[int][]byte)
+	// Derive redeem scripts up-front so fee estimation knows each input's
+	// scriptSig overhead.
+	redeemScripts := make(map[int][]byte)
 	for index, utxo := range inputs {
 		txHash, err := chainhash.NewHashFromStr(utxo.TxId)
 		if err != nil {
@@ -252,7 +280,7 @@ func (cs *ContractState) buildSpendTransaction(
 		txIn := wire.NewTxIn(outPoint, nil, nil)
 		tx.AddTxIn(txIn)
 
-		_, witnessScript, err := createP2SHAddressWithBackup(
+		_, redeemScript, err := createP2SHAddressWithBackup(
 			cs.PublicKeys.Primary,
 			cs.PublicKeys.Backup,
 			utxo.Tag, // already []byte
@@ -262,7 +290,7 @@ func (cs *ContractState) buildSpendTransaction(
 		if err != nil {
 			return nil, nil, 0, err
 		}
-		witnessScripts[index] = witnessScript
+		redeemScripts[index] = redeemScript
 	}
 
 	destAddr, err := btcutil.DecodeAddress(destAddress, cs.NetworkParams)
@@ -284,7 +312,7 @@ func (cs *ContractState) buildSpendTransaction(
 	tx.AddTxOut(destTxOut)
 
 	baseSize := int64(tx.SerializeSize())
-	fee, err := cs.calculateSegwitFee(baseSize, witnessScripts)
+	fee, err := cs.calculateP2SHFee(baseSize, redeemScripts)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -315,7 +343,7 @@ func (cs *ContractState) buildSpendTransaction(
 		addedOutputs := int64(0)
 		for range numChangeOuputs {
 			newBaseSize := baseSize + (addedOutputs+1)*changeOutputSize
-			newFee, err := cs.calculateSegwitFee(newBaseSize, witnessScripts)
+			newFee, err := cs.calculateP2SHFee(newBaseSize, redeemScripts)
 			if err != nil {
 				return nil, nil, 0, err
 			}
@@ -365,27 +393,30 @@ func (cs *ContractState) buildSpendTransaction(
 	}
 	fee = totalInputsAmount - outSum
 
-	return tx, witnessScripts, fee, nil
+	return tx, redeemScripts, fee, nil
 }
 
-// signSpendTransaction computes witness sighashes and requests TSS signing
-// for each input. Call this only after all validation checks have passed.
-func signSpendTransaction(tx *wire.MsgTx, inputs []*Utxo, witnessScripts map[int][]byte) (*SigningData, error) {
+// signSpendTransaction computes BIP16 sighashes (one per input) and
+// requests TSS signing for each. Dash is P2SH-only, so the sighash is
+// the legacy CalcSignatureHash form (subscript = redeem script, other
+// inputs' scriptSigs zeroed) — NOT the BIP143 witness sighash.
+//
+// The UnsignedSigHash.WitnessScript field name is retained for on-wire
+// msgpack compatibility (tag `ws`); the bytes it carries are the redeem
+// script that the bot embeds in scriptSig after signatures come back.
+//
+// Call this only after all validation checks have passed.
+func signSpendTransaction(tx *wire.MsgTx, inputs []*Utxo, redeemScripts map[int][]byte) (*SigningData, error) {
 	unsignedSigHashes := make([]UnsignedSigHash, len(inputs))
-	for i, utxo := range inputs {
-		witnessScript := witnessScripts[i]
+	for i := range inputs {
+		redeemScript := redeemScripts[i]
 
-		sigHashes := txscript.NewTxSigHashes(tx, txscript.NewCannedPrevOutputFetcher(utxo.PkScript, utxo.Amount))
-
-		sigHash, err := txscript.CalcWitnessSigHash(
-			witnessScript,
-			sigHashes,
+		sigHash, err := txscript.CalcSignatureHash(
+			redeemScript,
 			txscript.SigHashAll,
 			tx,
 			i,
-			utxo.Amount,
 		)
-
 		if err != nil {
 			return nil, err
 		}
@@ -395,7 +426,7 @@ func signSpendTransaction(tx *wire.MsgTx, inputs []*Utxo, witnessScripts map[int
 		unsignedSigHashes[i] = UnsignedSigHash{
 			Index:         uint32(i),
 			SigHash:       sigHash,
-			WitnessScript: witnessScript,
+			WitnessScript: redeemScript, // field name kept for wire-format compat
 		}
 	}
 

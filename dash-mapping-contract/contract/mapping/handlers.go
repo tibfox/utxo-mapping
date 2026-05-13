@@ -233,7 +233,7 @@ func (cs *ContractState) HandleUnmap(instructions *TransferParams) error {
 		}
 	}
 
-	tx, witnessScripts, btcFee, err := cs.buildSpendTransaction(
+	tx, redeemScripts, btcFee, err := cs.buildSpendTransaction(
 		inputUtxos,
 		totalInputAmt,
 		instructions.To,
@@ -285,7 +285,7 @@ func (cs *ContractState) HandleUnmap(instructions *TransferParams) error {
 	}
 
 	// All checks passed — now request TSS signing
-	signingData, err := signSpendTransaction(tx, inputUtxos, witnessScripts)
+	signingData, err := signSpendTransaction(tx, inputUtxos, redeemScripts)
 	if err != nil {
 		return ce.WrapContractError(ce.ErrTransaction, err, "error signing spend transaction")
 	}
