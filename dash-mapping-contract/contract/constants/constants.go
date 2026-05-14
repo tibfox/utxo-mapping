@@ -48,11 +48,12 @@ const MaxUnmapPerBlockKey = "muxb"
 // = uint64 BE Hive block height || uint64 BE accumulated duffs.
 const BlockUnmapAccKey = "buac"
 
-// Instruction URL search param keys
+// Instruction URL search param keys. Kept identical to btc-mapping-contract
+// so swap callers can use the same grammar across chains (and so a router
+// front-end can treat all utxo-mapping contracts uniformly).
 const (
 	DepositToKey        = "deposit_to"
 	SwapAssetOut        = "swap_asset_out"
-	SwapNetworkOut      = "swap_network_out"
 	SwapToKey           = "swap_to"
 	DestinationChainKey = "destination_chain"
 	ReturnAddressKey    = "return_address"

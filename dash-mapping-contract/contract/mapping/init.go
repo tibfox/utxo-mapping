@@ -161,8 +161,8 @@ func (cs *ContractState) parseInstructions(
 			mappingType = MapDeposit
 		} else if params.Has(constants.SwapToKey) {
 			recipient = params.Get(constants.SwapToKey)
-			recipientNetwork := params.Get(constants.SwapNetworkOut)
-			if recipientNetwork == "dash" {
+			destinationChain := params.Get(constants.DestinationChainKey)
+			if strings.ToLower(destinationChain) == "dash" {
 				return nil, ce.NewContractError(ce.ErrInput, "output network cannot be dash")
 			}
 			mappingType = MapSwap
