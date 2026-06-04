@@ -41,6 +41,10 @@ const (
 	SwapAssetOut        = "swap_asset_out"
 	SwapToKey           = "swap_to"
 	DestinationChainKey = "destination_chain"
+	// SwapMinAmountOut is the optional slippage floor for a BTC swap-deposit.
+	// review7 MED-15: without it the swap instruction was built with no
+	// min_amount_out, so an ingress swap had zero slippage protection.
+	SwapMinAmountOut = "swap_min_amount_out"
 )
 
 // Address Creation

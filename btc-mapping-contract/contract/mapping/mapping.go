@@ -202,6 +202,15 @@ func (ms *MappingState) processUtxos(relevantUtxos []Utxo, from string, blockHei
 					Recipient:        metadata.Recipient,
 					DestinationChain: metadata.Params.Get(constants.DestinationChainKey),
 				}
+				// review7 MED-15: forward an optional slippage floor so an
+				// ingress BTC swap-deposit isn't executed with zero slippage
+				// protection. The depositor sets swap_min_amount_out in the
+				// deposit metadata; the router enforces it (and rejects a
+				// negative value — see dex M2).
+				if metadata.Params.Has(constants.SwapMinAmountOut) {
+					minOut := metadata.Params.Get(constants.SwapMinAmountOut)
+					instruction.MinAmountOut = &minOut
+				}
 				instrJson, err := tinyjson.Marshal(instruction)
 				if err != nil {
 					return ce.NewContractError(ce.ErrJson, "error marshalling swap instruction: "+err.Error())
