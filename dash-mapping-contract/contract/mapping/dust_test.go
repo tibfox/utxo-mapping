@@ -39,13 +39,18 @@ func newTestState(t *testing.T, baseFeeRate int64) *ContractState {
 	t.Helper()
 	primaryHex := "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 	backupHex := "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
-	params := &chaincfg.RegressionNetParams
+	// Match the contract's dashRegTestParams (init.go:38) so the
+	// audit MX-L4 destination-type guard can decode the 'y…'
+	// regtest P2PKH addresses regtestDestAddr produces.
+	dashRegtest := chaincfg.RegressionNetParams
+	dashRegtest.PubKeyHashAddrID = 0x8c
+	dashRegtest.ScriptHashAddrID = 0x13
 	return &ContractState{
 		PublicKeys: PublicKeys{
 			Primary: mustDecodePub(t, primaryHex),
 			Backup:  mustDecodePub(t, backupHex),
 		},
-		NetworkParams: params,
+		NetworkParams: &dashRegtest,
 		Supply:        SystemSupply{BaseFeeRate: baseFeeRate},
 	}
 }
@@ -70,8 +75,11 @@ func sumOutputs(t *testing.T, out [][2]int64) int64 {
 	return s
 }
 
-// regtestDestAddr returns a P2WPKH address derived from the backup
-// pubkey on regtest — mirrors btctest_test.go's regtestDestAddress.
+// regtestDestAddr returns a legacy P2PKH address on Dash regtest
+// (y… prefix) — see audit MX-L4: Dash never activated SegWit so
+// P2WPKH bcrt1q… addresses are now rejected by the unmap path's
+// destination-type guard. The Dash regtest params override the
+// vanilla BTC regtest PubKeyHashAddrID (0x6f) with 0x8c.
 func regtestDestAddr(t *testing.T) string {
 	t.Helper()
 	backupHex := "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
@@ -79,7 +87,10 @@ func regtestDestAddr(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("decode backup pubkey: %v", err)
 	}
-	addr, err := btcutil.NewAddressWitnessPubKeyHash(btcutil.Hash160(b), &chaincfg.RegressionNetParams)
+	dashRegtest := chaincfg.RegressionNetParams
+	dashRegtest.PubKeyHashAddrID = 0x8c // Dash 'y' prefix
+	dashRegtest.ScriptHashAddrID = 0x13 // Dash '8'/'9' prefix
+	addr, err := btcutil.NewAddressPubKeyHash(btcutil.Hash160(b), &dashRegtest)
 	if err != nil {
 		t.Fatalf("derive regtest dest address: %v", err)
 	}
