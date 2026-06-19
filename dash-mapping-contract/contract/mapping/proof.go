@@ -67,6 +67,34 @@ func verifyMerkleProof(
 	proof []chainhash.Hash,
 	merkleRoot chainhash.Hash,
 ) bool {
+	// Audit FD-MERKLE (LOW 3.0): the previous implementation didn't
+	// bound txIndex against the proof length. A txIndex >=
+	// 2^len(proof) is mathematically impossible for the proof to
+	// be valid against — reject up front rather than running the
+	// hash chain over a nonsensical position.
+	//
+	// A len-0 proof IS valid for a block with exactly one tx
+	// (regtest single-tx blocks); in that case txIndex must be 0
+	// and txHash IS the merkleRoot. The default below preserves
+	// that case.
+	if len(proof) == 0 {
+		if txIndex != 0 {
+			return false
+		}
+		return txHash.IsEqual(&merkleRoot)
+	}
+	// 2^len(proof) is the binary-tree leaf count this proof can
+	// authenticate. Cap shift at 32 so the result fits in uint64
+	// even for absurd proof lengths.
+	shift := len(proof)
+	if shift > 32 {
+		shift = 32
+	}
+	maxIdx := uint64(1) << uint(shift)
+	if uint64(txIndex) >= maxIdx {
+		return false
+	}
+
 	currentHash := txHash
 	index := txIndex
 
@@ -88,3 +116,4 @@ func verifyMerkleProof(
 
 	return currentHash.IsEqual(&merkleRoot)
 }
+

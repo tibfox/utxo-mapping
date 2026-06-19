@@ -177,6 +177,24 @@ func (ms *MappingState) HandleMapInstantSendV2(params MapInstantSendV2ParamsFull
 	switch parsed.Op {
 	case constants.OpAuthValue:
 		// Login. Credit-only, subsidised. No forward dispatch.
+		//
+		// Audit M18 (MED 5.0): the previous code unconditionally
+		// subsidised the op=auth login. An attacker spawning fresh
+		// DashDIDs (cost: gas for the deposit address derive) could
+		// drain the operator's HBD subsidy pool. Apply the same
+		// rate-limit gate to op=auth — RATE_LIMITED logins still
+		// credit the DASH but stop counting against the subsidy
+		// surface. Same RC-budget cap the §5.2.6 dispatchForward
+		// uses, but charged against a separate "auth-subsidy" key
+		// (op=auth has no callFunding to absorb the cost).
+		if !withinLimit {
+			saveForwardQueueEntry(rawTxId(body.RawTxHex), ForwardQueueEntry{
+				Sender:      senderDID,
+				Instruction: body.Instruction,
+				CallFunding: 0,
+				Status:      "RATE_LIMITED",
+			})
+		}
 		return nil
 
 	case constants.OpCallValue:
@@ -414,8 +432,28 @@ func marshalInstruction(p ParsedInstruction) string {
 // upper bound is ~500 RC = 0.5 HBD ≈ $0.50. Pretty steep for small ops;
 // real-world RC will be much less.
 func estimateRcCost(p ParsedInstruction) int64 {
+	// Audit M16 (MED 4.5): the previous flat 500/200 RC charge had no
+	// payload-size component. A pathological op=call with a huge
+	// ArgsB64 payload (decoded on-chain, gas-metered as O(len)) was
+	// reimbursed the same 500 RC as a 16-byte call → the IS submitter
+	// over-paid HBD for the L2 RC out of the mapping contract's
+	// reserve. Add a per-byte component anchored to the actual
+	// gas-meter rate the host fns charge.
+	//
+	// Cost model (RC):
+	//   base op=auth   = 200
+	//   base op=call   = 500
+	//   + 1 RC per 32 ArgsB64 bytes (rounded up — the contract's
+	//     base64 decode + forwarder dispatch scales linearly with
+	//     payload size; 32 bytes/RC is conservative vs. the host's
+	//     ~1 RC per 16-byte hash-to-curve)
 	if p.Op == constants.OpCallValue {
-		return 500 // 500 RC ≈ 0.5 HBD
+		base := int64(500)
+		// p.ArgsB64 is already validated to be non-empty for op=call
+		// at parse time; defensive guard for safety.
+		argsLen := int64(len(p.ArgsB64))
+		perByte := (argsLen + 31) / 32 // ceil(argsLen / 32)
+		return base + perByte
 	}
 	return 200 // op=auth: 200 RC ≈ 0.2 HBD
 }

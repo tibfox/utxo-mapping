@@ -5,6 +5,7 @@ import (
 	ce "dash-mapping-contract/contract/contracterrors"
 	"dash-mapping-contract/sdk"
 	"bytes"
+	"strconv"
 
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -169,6 +170,14 @@ func (cs *ContractState) estimateFee(numInputs int64, amount, inputAmount int64)
 	return fee, nil
 }
 
+// maxUtxoInputsPerSpend caps how many UTXOs a single unmap spend can
+// consume. Audit MX-L5 (LOW): without a cap, a withdrawal that pulls
+// thousands of dust UTXOs stresses the TSS signing protocol (one round
+// per input) and inflates the tx beyond standard mempool limits. 100
+// inputs is far above any realistic withdrawal; reaching it indicates
+// the caller is grinding dust + should consolidate first.
+const maxUtxoInputsPerSpend = 100
+
 // returns a list of internal ids of inputs for making a tx
 func (cs *ContractState) getInputUtxoIds(amount int64) ([]uint16, int64, error) {
 	inputs := []uint16{}
@@ -201,6 +210,12 @@ func (cs *ContractState) getInputUtxoIds(amount int64) ([]uint16, int64, error) 
 	var err error
 	for _, entry := range cs.UtxoList {
 		if entry.Id >= constants.UtxoConfirmedPoolStart {
+			// Audit MX-L5: cap input count.
+			if len(inputs) >= maxUtxoInputsPerSpend {
+				return nil, 0, ce.NewContractError(ce.ErrBalance,
+					"unmap would require >"+strconv.Itoa(maxUtxoInputsPerSpend)+
+						" UTXO inputs (dust grind risk); consolidate via smaller unmaps first")
+			}
 			inputs = append(inputs, entry.Id)
 			accAmount, err = safeAdd64(accAmount, entry.Amount)
 			if err != nil {
@@ -226,6 +241,12 @@ func (cs *ContractState) getInputUtxoIds(amount int64) ([]uint16, int64, error) 
 
 	// uses unconfirmed txs only if all confirmed txs are insufficient
 	for _, u := range unconfirmedTxs {
+		// Audit MX-L5: cap also applies to the unconfirmed-fallback path.
+		if len(inputs) >= maxUtxoInputsPerSpend {
+			return nil, 0, ce.NewContractError(ce.ErrBalance,
+				"unmap would require >"+strconv.Itoa(maxUtxoInputsPerSpend)+
+					" UTXO inputs; consolidate first")
+		}
 		inputs = append(inputs, u.id)
 		accAmount, err = safeAdd64(accAmount, u.amount)
 		if err != nil {

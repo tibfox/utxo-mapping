@@ -64,7 +64,11 @@ func (cs *ContractState) HandleUnmap(instructions *TransferParams) error {
 	if amount <= 0 {
 		return ce.NewContractError(ce.ErrInput, "amount must be positive")
 	}
-	if amount <= dustThreshold {
+	// Audit MX-L3 (LOW): off-by-one — the previous `<=` rejected
+	// `amount == dustThreshold` even though the threshold IS exactly
+	// the spendable minimum. Accept `==` so an exactly-at-dust unmap
+	// goes through (matches dashd's mempool acceptance).
+	if amount < dustThreshold {
 		return ce.NewContractError(ce.ErrInput, "amount below dust threshold")
 	}
 
