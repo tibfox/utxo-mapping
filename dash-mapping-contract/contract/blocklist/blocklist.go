@@ -110,10 +110,27 @@ func HandleAddBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uint32,
 		return 0, ce.NewContractError(ce.ErrInput, "error decoding block header: "+err.Error())
 	}
 
-	// Dash uses X11 for PoW which is not available in btcsuite, so we skip
-	// the PoW check here. Header integrity is enforced by the oracle before
-	// addBlocks is called; here we only validate decodability and chain
-	// linkage by PrevBlock hash.
+	// Audit FD-NOPOW (MED): Dash's X11 PoW algorithm is not in btcsuite,
+	// so the full target-hash check is not feasible inside the
+	// tinygo-wasm contract (X11 chains 11 hash functions: blake/bmw/
+	// groestl/jh/keccak/skein/luffa/cubehash/shavite/simd/echo — none
+	// available in the wasm runtime). The TRUST ANCHOR for this
+	// contract's header chain is the ORACLE QUORUM that signs addBlocks
+	// submissions; PoW is only verified off-chain by the oracle's full
+	// nodes before the addBlocks call lands here.
+	//
+	// Defense in depth (this commit): we still apply two cheap structural
+	// checks that catch an oracle-side attacker who tries to submit a
+	// fake low-work fork to mint coins via the slow path:
+	//   1. Reject degenerate Bits values (0 or 0xffffffff).
+	//   2. Bound per-block difficulty DROPS — the compact-Bits exponent
+	//      may grow by at most 1 vs the prior block (Dash Dark Gravity
+	//      Wave caps real-world per-block adjustments to <1%; an
+	//      exponent jump of +1 implies ≥256× easier difficulty, well
+	//      above any legitimate DGW retarget).
+	// Neither check substitutes for X11 verification under a fully
+	// compromised oracle — they raise the bar from "any header accepted"
+	// to "headers must claim plausibly-mined difficulty levels."
 	for _, headerBytes := range rawHeaders {
 		// won't happen for 130 years but just in case
 		if lastHeight == math.MaxUint32 {
@@ -125,6 +142,11 @@ func HandleAddBlocks(rawHeaders []BlockHeaderBytes, networkMode string) (uint32,
 		err = blockHeader.BtcDecode(bytes.NewReader(headerBytes[:]), wire.ProtocolVersion, wire.LatestEncoding)
 		if err != nil {
 			return 0, ce.NewContractError(ce.ErrInput, "error decoding block header: "+err.Error())
+		}
+
+		// FD-NOPOW defense-in-depth: degenerate-Bits + exponent-drop bound.
+		if err := validateBitsContinuity(lastBlockHeader.Bits, blockHeader.Bits); err != nil {
+			return 0, ce.WrapContractError(ce.ErrInput, err, "header at height "+strconv.FormatUint(uint64(blockHeight), 10)+" failed FD-NOPOW sanity check")
 		}
 
 		lastBlockHash := lastBlockHeader.BlockHash()
@@ -214,6 +236,14 @@ func HandleReplaceBlock(rawHeader BlockHeaderBytes, networkMode string) (uint32,
 	prevHash := prevHeader.BlockHash()
 	if !newHeader.PrevBlock.IsEqual(&prevHash) {
 		return 0, ce.NewContractError(ce.ErrInput, "replacement block does not chain to block at height "+strconv.FormatUint(uint64(prevHeight), 10))
+	}
+
+	// Audit FD-NOPOW: same degenerate-Bits + exponent-drop bound the
+	// addBlocks path enforces. A replacement that drops difficulty
+	// massively vs the chain ancestor is the slow-path attack vector
+	// FD-NOPOW flags — refuse it before overwriting the tip.
+	if err := validateBitsContinuity(prevHeader.Bits, newHeader.Bits); err != nil {
+		return 0, ce.WrapContractError(ce.ErrInput, err, "replacement header failed FD-NOPOW sanity check")
 	}
 
 	// overwrite the tip
@@ -335,4 +365,45 @@ func HandleSeedBlocks(seedParams SeedBlocksParams, allowReseed bool) (uint32, er
 		ce.ErrInput,
 		"last height >= input block height. last height: "+strconv.FormatUint(uint64(lastHeight), 10),
 	)
+}
+
+// validateBitsContinuity is the audit FD-NOPOW defense-in-depth check:
+// the X11 hash isn't available in the wasm runtime so we can't verify
+// the header was actually mined to the target encoded in Bits, but we
+// can still reject obviously-wrong Bits values.
+//
+//   - Degenerate: Bits == 0 (target is 0 = unachievable) or 0xffffffff
+//     (target overflow). Bitcoin's wire format treats neither as valid.
+//   - Exponent drop bound: in compact-Bits the top byte is the exponent.
+//     Dash Dark Gravity Wave caps per-block difficulty change at <1%; a
+//     legitimate header NEVER drops difficulty by more than ~256× in a
+//     single block. We allow the exponent to grow by up to 1 (= up to
+//     256× easier), well above any real DGW retarget. Anything larger
+//     is rejected — it implies an attacker is claiming a near-genesis
+//     fork to mine slow-path-eligible blocks cheaply.
+//
+// Neither check substitutes for the real X11 PoW verification under a
+// fully-compromised oracle. The oracle quorum signs every addBlocks
+// call and IS the trust anchor; this function just catches the simplest
+// "any header accepted" attacks.
+func validateBitsContinuity(prevBits, newBits uint32) error {
+	if newBits == 0 || newBits == 0xffffffff {
+		return ce.NewContractError(ce.ErrInput, "degenerate Bits "+strconv.FormatUint(uint64(newBits), 16))
+	}
+	if prevBits == 0 || prevBits == 0xffffffff {
+		// previous header was already corrupt — refuse to chain off it.
+		return ce.NewContractError(ce.ErrInput, "prior header has degenerate Bits "+strconv.FormatUint(uint64(prevBits), 16))
+	}
+	prevExp := uint8(prevBits >> 24)
+	newExp := uint8(newBits >> 24)
+	// allow exponent to GROW by at most 1 (= up to 256× easier). The
+	// reverse direction (newExp < prevExp = harder) is unbounded; harder
+	// claimed difficulty isn't a slow-path attack vector.
+	if newExp > prevExp && newExp-prevExp > 1 {
+		return ce.NewContractError(ce.ErrInput,
+			"difficulty drop too large: prev exp 0x"+strconv.FormatUint(uint64(prevExp), 16)+
+				", new exp 0x"+strconv.FormatUint(uint64(newExp), 16)+
+				" (exceeds the +1 per-block exponent cap; legit Dash DGW retargets are <1% per block)")
+	}
+	return nil
 }
