@@ -199,8 +199,10 @@ func AddBlocks(addBlocksInput *string) *string {
 	if err != nil {
 		ce.CustomAbort(err)
 	}
+	// Audit S-7 (LOW 3.5 — port of dash FD-NEGFEE): clamp <=0 not ==0
+	// so a negative oracle-reported fee can't persist as BaseFeeRate.
 	latestFee := addBlocksObj.LatestFee
-	if latestFee == 0 {
+	if latestFee <= 0 {
 		latestFee = 1
 	}
 	systemSupply.BaseFeeRate = latestFee
@@ -426,7 +428,10 @@ func Approve(input *string) *string {
 	if params.Spender == env.Caller.String() {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "cannot approve self as spender"))
 	}
-	mapping.HandleApprove(env.Caller.String(), params.Spender, amount)
+	// Audit S-1: HandleApprove now returns error from checkAuth gate.
+	if err := mapping.HandleApprove(env.Caller.String(), params.Spender, amount); err != nil {
+		ce.CustomAbort(err)
+	}
 	return mapping.StrPtr("0")
 }
 

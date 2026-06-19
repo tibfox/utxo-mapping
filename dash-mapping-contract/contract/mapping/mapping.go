@@ -194,6 +194,10 @@ func (ms *MappingState) processUtxos(relevantUtxos []Utxo, from string, blockHei
 				}
 				assetOut := metadata.Params.Get(constants.SwapAssetOut)
 
+				// Audit FD-SLIP (5.5, port of BTC DX-H5): forward the
+				// depositor's min_amount_out param so the ingress swap
+				// honours their slippage bound. Previously built WITHOUT
+				// MinAmountOut → swap executed at any price (sandwichable).
 				instruction := DexInstruction{
 					Type:             "swap",
 					Version:          "1.0.0",
@@ -202,6 +206,10 @@ func (ms *MappingState) processUtxos(relevantUtxos []Utxo, from string, blockHei
 					AssetOut:         assetOut,
 					Recipient:        metadata.Recipient,
 					DestinationChain: metadata.Params.Get(constants.DestinationChainKey),
+				}
+				if metadata.Params.Has(constants.MinAmountOutKey) {
+					minOut := metadata.Params.Get(constants.MinAmountOutKey)
+					instruction.MinAmountOut = &minOut
 				}
 				instrJson, err := tinyjson.Marshal(instruction)
 				if err != nil {

@@ -51,6 +51,12 @@ func checkOracle() {
 	)
 }
 
+// checkAdmin gates "oracle or owner". Used for low-risk operational
+// actions that the oracle's hot key may legitimately invoke
+// (currently only `prune` retains this gate). Governance-class
+// wasmexports (replaceBlock(s), setForwarderContractId,
+// setValidatorSet, setMinAttestations, allow-list mutations, etc.)
+// were narrowed to checkOwner — audit H3 (CVSS 7.5).
 func checkAdmin() {
 	caller := sdk.GetEnv().Caller.String()
 	if caller == constants.OracleAddress || caller == *sdk.GetEnvKey("contract.owner") {
@@ -61,6 +67,13 @@ func checkAdmin() {
 	)
 }
 
+// checkOwner gates "owner only" — governance + state-rewrite class.
+// Per audit H3, the oracle hot-key was previously inside checkAdmin
+// reach for replaceBlock(s), setForwarderContractId, setValidatorSet,
+// setMinAttestations, and the allow-list timelock actions. Compromising
+// the always-online oracle forged SPV headers + rewrote the validator
+// set. Owner-only ensures a separate (cold-storage / multisig) key
+// material is required for those actions.
 func checkOwner() {
 	if sdk.GetEnv().Caller.String() != *sdk.GetEnvKey("contract.owner") {
 		ce.CustomAbort(
@@ -80,7 +93,7 @@ func checkNotPaused() {
 
 //go:wasmexport seedBlocks
 func SeedBlocks(blockSeedInput *string) *string {
-	checkAdmin()
+	checkOwner()
 
 	var seedParams blocklist.SeedBlocksParams
 	err := tinyjson.Unmarshal([]byte(*blockSeedInput), &seedParams)
@@ -109,7 +122,7 @@ func SeedBlocks(blockSeedInput *string) *string {
 //
 //go:wasmexport initPruning
 func InitPruning(input *string) *string {
-	checkAdmin()
+	checkOwner()
 
 	floor, err := strconv.ParseUint(*input, 10, 32)
 	if err != nil {
@@ -135,7 +148,7 @@ func InitPruning(input *string) *string {
 //
 //go:wasmexport setMaxUnmapPerBlock
 func SetMaxUnmapPerBlock(input *string) *string {
-	checkAdmin()
+	checkOwner()
 	if input == nil || *input == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "expected duffs-per-block as integer string"))
 	}
@@ -203,8 +216,13 @@ func AddBlocks(addBlocksInput *string) *string {
 	if err != nil {
 		ce.CustomAbort(err)
 	}
+	// Audit FD-NEGFEE (LOW 3.5): the previous `==0` guard let a
+	// negative oracle-reported fee persist as BaseFeeRate (consumption-
+	// side floor mitigated the practical damage but left the
+	// `if state.BaseFeeRate <= 0 { … }` defensive branches forever
+	// active). BTC clamps with `<=0`; mirror that here.
 	latestFee := addBlocksObj.LatestFee
-	if latestFee == 0 {
+	if latestFee <= 0 {
 		latestFee = 1
 	}
 	systemSupply.BaseFeeRate = latestFee
@@ -216,7 +234,7 @@ func AddBlocks(addBlocksInput *string) *string {
 
 //go:wasmexport replaceBlock
 func ReplaceBlock(input *string) *string {
-	checkAdmin()
+	checkOwner()
 
 	blockBytes, err := hex.DecodeString(*input)
 	if err != nil {
@@ -244,7 +262,7 @@ func ReplaceBlock(input *string) *string {
 //
 //go:wasmexport replaceBlocks
 func ReplaceBlocks(input *string) *string {
-	checkAdmin()
+	checkOwner()
 
 	blockHeaders, err := blocklist.DivideHeaderList(input)
 	if err != nil {
@@ -342,19 +360,30 @@ func MapInstantSendV2(payload *string) *string {
 
 // SetForwarderContractId — admin action to designate the canonical
 // dash-forwarder-contract id this mapping trusts. Idempotent: re-setting
-// to the same value is a no-op; changing to a different value requires
-// pausing the contract first.
+// to the same value is a no-op.
+//
+// Audit M9 (5.5): the previous docstring read "changing to a different
+// value requires pausing the contract first", but no `clearForwarderContractId`
+// export exists in this build. Path B forwarder migration (see
+// docs/dash-is-login/trusted-forwarders-governance.md) requires a
+// vsc.update_contract patch that ADDS such an export, walks through
+// the contract-update timelock, then runs pause + clear + setForwarder
+// + unpause. This is the heavy-path designed-into-the-spec migration;
+// the lock-after-first-set behavior here is intentional.
 //
 //go:wasmexport setForwarderContractId
 func SetForwarderContractId(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "forwarder contract id required"))
 	}
 	existing := sdk.StateGetObject(constants.ForwarderContractIdStateKey)
 	if existing != nil && *existing != "" && *existing != *payload {
+		// Audit M9: the user-visible error now points to the actual
+		// migration path (vsc.update_contract → patch in a clear
+		// action → cycle) instead of the misleading "pause+clear" phrase.
 		ce.CustomAbort(ce.NewContractError(ce.ErrNoPermission,
-			"forwarder contract id already set; pause + clear required to change"))
+			"forwarder contract id locked-after-first-set; migration requires a vsc.update_contract patch adding a clearForwarderContractId export (Path B in trusted-forwarders-governance.md)"))
 	}
 	sdk.StateSetObject(constants.ForwarderContractIdStateKey, *payload)
 	return mapping.StrPtr("0")
@@ -370,7 +399,7 @@ func SetForwarderContractId(payload *string) *string {
 //
 //go:wasmexport addAllowedTarget
 func AddAllowedTarget(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "target contract id required"))
 	}
@@ -405,7 +434,7 @@ func CommitAllowedTarget(payload *string) *string {
 
 // SetAllowedTargetImmediate — REGTEST ONLY: admin promotes a
 // target straight into the active allowlist, bypassing the
-// AllowListGovernanceTimelockBlocks 7-day cooldown. Refuses on
+// AllowListGovernanceTimelockBlocks 3-day cooldown. Refuses on
 // mainnet AND on real testnet — only the throwaway regtest harness
 // (devnet/CI runs) exposes this. Audit SEC-3 (R15) called out the
 // old testnet-or-regtest gate as a footgun: a `dev.wasm` accidentally
@@ -419,7 +448,7 @@ func CommitAllowedTarget(payload *string) *string {
 //
 //go:wasmexport setAllowedTargetImmediate
 func SetAllowedTargetImmediate(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if !constants.IsRegtest(NetworkMode) {
 		ce.CustomAbort(ce.NewContractError(ce.ErrNoPermission,
 			"setAllowedTargetImmediate is regtest-only; use addAllowedTarget+commitAllowedTarget"))
@@ -514,7 +543,7 @@ func SeedInternalHbd(payload *string) *string {
 //
 //go:wasmexport cancelAllowedTargetAdd
 func CancelAllowedTargetAdd(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "target contract id required"))
 	}
@@ -529,7 +558,7 @@ func CancelAllowedTargetAdd(payload *string) *string {
 //
 //go:wasmexport removeAllowedTarget
 func RemoveAllowedTarget(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "target contract id required"))
 	}
@@ -565,7 +594,7 @@ func CommitAllowedTargetRemove(payload *string) *string {
 //
 //go:wasmexport cancelAllowedTargetRemove
 func CancelAllowedTargetRemove(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "target contract id required"))
 	}
@@ -609,7 +638,7 @@ func CancelAllowedTargetRemove(payload *string) *string {
 //
 //go:wasmexport setValidatorSet
 func SetValidatorSet(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "validator-set payload required"))
 	}
@@ -628,7 +657,7 @@ func SetValidatorSet(payload *string) *string {
 //
 //go:wasmexport setMinAttestations
 func SetMinAttestations(payload *string) *string {
-	checkAdmin()
+	checkOwner()
 	if payload == nil || *payload == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "threshold required"))
 	}

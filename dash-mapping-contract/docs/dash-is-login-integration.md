@@ -38,7 +38,7 @@ Spec §5.2.7 — v1 initial list is exactly the magi-dex router.
 Key:   `at/<contract-id>`
 Value: `"1"` if allowed; missing/empty otherwise.
 
-Adding requires the 7-day `AllowListGovernanceTimelockBlocks` cooldown
+Adding requires the 3-day `AllowListGovernanceTimelockBlocks` cooldown
 via `addAllowedTarget` + `commitAllowedTarget` (both shipped; see
 `deployment-runbook.md §2.5`). Removal follows the symmetric
 `removeAllowedTarget` + `commitRemoveAllowedTarget` pair.
@@ -161,7 +161,7 @@ HandleMapInstantSendV2(rawTxHex, instruction, epoch, attestations):
   "login-only credit, no value movement" path to save gas. Deferred until
   measurement shows it matters.
 
-- **Allow-list governance contract**: spec §5.2.7 7-day timelock now
+- **Allow-list governance contract**: spec §5.2.7 3-day timelock now
   shipped (addAllowedTarget + commitAllowedTarget; symmetric
   remove pair). v1 mainnet ships with a single admin signer; an
   on-chain multisig governance contract sitting in front of the

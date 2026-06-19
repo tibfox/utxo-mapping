@@ -118,15 +118,31 @@ func Execute(txid string) error {
 			"args= field not valid base64: "+b64err.Error())
 	}
 	result := sdk.ContractCallAs(parsed.Target, parsed.Method, decodedArgs, entry.Sender, &sdk.ContractCallOptions{})
-	if result == nil {
-		return ce.NewError(ce.ErrTransaction,
-			"target call returned nil — assumed failed")
+	// Audit M12 (5.5): the previous nil-only check let an aborted
+	// target return propagate as success — the dispatcher would then
+	// mark the forwardQueue FORWARDED and consume the RC budget even
+	// though the user-visible target state didn't change. Mirror the
+	// mapping's mapInstantSendV2:310 check (result==nil OR ABORT:
+	// prefix) so a non-nil but failed call is properly surfaced as
+	// transaction failure → caller's forwardQueue is FORWARD_FAILED
+	// + the HBD reimbursement is refunded.
+	if result == nil || isAbortResult(*result) {
+		msg := "target call failed"
+		if result != nil {
+			msg = msg + ": " + *result
+		}
+		return ce.NewError(ce.ErrTransaction, msg)
 	}
-	// (SDK ContractCallAs returns the call result string; any contract-
-	// level error there is surfaced via the result struct's Ok=false.
-	// Workstream 5 will define exactly how mapping interprets the
-	// return; for now we just return success on non-nil.)
 	return nil
+}
+
+// isAbortResult detects target failure from a non-nil call return.
+// Mirrors dash-mapping-contract/contract/mapping/mapinstantsend_v2.go:342.
+// Contracts using the SDK abort path return a string starting with
+// "ABORT:" + the error message; treating those as success was the
+// audit M12 misreport.
+func isAbortResult(result string) bool {
+	return len(result) >= 6 && result[:6] == "ABORT:"
 }
 
 // ParsedInstruction is the structured form of an op=call instruction.
@@ -221,6 +237,14 @@ func SerializeForwardQueueEntry(e ForwardQueueEntry) string {
 
 // ===== helpers (no strconv to keep WASM build tight) =====
 
+// parseInt64 parses a decimal int64 from a string.
+//
+// Audit L7: the previous implementation built `n` via plain `n*10 +
+// digit` with no overflow check. A 20-digit input (e.g. 19 nines or
+// MaxInt64+1 = 9223372036854775808) wrapped silently into a negative
+// or near-zero int64 and could land in CallFunding / amount fields
+// downstream. Mirror the standard-library strconv.ParseInt overflow
+// behaviour (return error before the wrap).
 func parseInt64(s string) (int64, error) {
 	if s == "" {
 		return 0, ce.NewError(ce.ErrInput, "empty number")
@@ -230,14 +254,28 @@ func parseInt64(s string) (int64, error) {
 	if s[0] == '-' {
 		neg = true
 		i = 1
+		if len(s) == 1 {
+			return 0, ce.NewError(ce.ErrInput, "lone minus sign")
+		}
 	}
+	const maxInt64 = int64(9223372036854775807)
+	const cutoff = maxInt64 / 10
+	const cutoffDigit = uint8(maxInt64 % 10)
 	var n int64
 	for ; i < len(s); i++ {
 		c := s[i]
 		if c < '0' || c > '9' {
 			return 0, ce.NewError(ce.ErrInput, "non-digit in number: "+s)
 		}
-		n = n*10 + int64(c-'0')
+		d := c - '0'
+		// Audit L7: detect overflow BEFORE the multiply/add that would
+		// wrap. n > cutoff means n*10 would overflow; n == cutoff and
+		// d > cutoffDigit means n*10+d would overflow into the negative
+		// (positive int64 max is 9223372036854775807).
+		if n > cutoff || (n == cutoff && d > cutoffDigit) {
+			return 0, ce.NewError(ce.ErrInput, "number overflows int64: "+s)
+		}
+		n = n*10 + int64(d)
 	}
 	if neg {
 		n = -n

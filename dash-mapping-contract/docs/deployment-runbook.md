@@ -168,7 +168,7 @@ payload: <target-contract-id>
 ```
 
 Adds a contract to the `op=call` allow-list. The spec §5.2.7 mandates a
-7-day timelock (86_400 blocks) on additions and removals.
+3-day timelock (86_400 blocks) on additions and removals.
 
 1. Admin proposes via `addAllowedTarget`; the entry sits in `pendingAdd`
    with an unlock-block timestamp.
@@ -194,7 +194,7 @@ real testnet now exercises the same add+commit timelock flow as
 mainnet so the timelock pathway itself gets tested.
 
 Writes directly into the active `allowedTargets` map, bypassing
-the 7-day timelock. Required so devnet/CI regtest runs can
+the 3-day timelock. Required so devnet/CI regtest runs can
 exercise the op=call dispatch path without burning 86,400 regtest
 blocks of mining. **Testnet + mainnet allowlist mutations MUST go
 through the symmetric add+commit pair above.**

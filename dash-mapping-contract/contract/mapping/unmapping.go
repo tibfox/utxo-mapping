@@ -430,24 +430,55 @@ func (cs *ContractState) buildSpendTransaction(
 	return tx, witnessScripts, fee, nil
 }
 
-// signSpendTransaction computes witness sighashes and requests TSS signing
-// for each input. Call this only after all validation checks have passed.
+// signSpendTransaction computes legacy P2SH sighashes and requests TSS
+// signing for each input. Call this only after all validation checks
+// have passed.
+//
+// Audit FD4-C1 (CVSS 9.1 LAUNCH-BLOCKING): the previous implementation
+// signed BIP143 witness sighashes (CalcWitnessSigHash + NewTxSigHashes
+// + NewCannedPrevOutputFetcher), but Dash deposit addresses are plain
+// legacy P2SH (utils.go:32-37: "Dash never activated SegWit so we MUST
+// use P2SH"). The bot then placed the signature in tx.TxIn[i].Witness
+// instead of SignatureScript. btcd's txscript.Engine rejected every
+// withdrawal as "signature script for witness nested p2sh is not
+// canonical", and HandleUnmap had ALREADY burned the balance + deleted
+// the UTXOs before producing the unspendable tx → permanent total
+// loss on every withdrawal.
+//
+// Fix: use the legacy CalcSignatureHash with the redeem script. The
+// msgp wire-tag `ws` is preserved on the UnsignedSigHash struct so
+// the bot's existing decoder still reads the right field; the semantic
+// is now "redeem script for legacy P2SH" instead of "witness script
+// for P2WSH". The bot's attachSignatures must place the signature in
+// tx.TxIn[i].SignatureScript = <sig> <redeemScript> (BIP16 spend
+// shape) — see go-vsc-node/cmd/mapping-bot/mapper/unmapping.go.
+//
+// The `witnessScripts` parameter name is preserved to avoid touching
+// every caller; the bytes it carries are now redeem scripts for the
+// legacy P2SH path.
 func signSpendTransaction(tx *wire.MsgTx, inputs []*Utxo, witnessScripts map[int][]byte) (*SigningData, error) {
 	unsignedSigHashes := make([]UnsignedSigHash, len(inputs))
-	for i, utxo := range inputs {
-		witnessScript := witnessScripts[i]
+	for i := range inputs {
+		// `inputs[i]` is unused on the legacy P2SH sighash path
+		// (CalcSignatureHash doesn't need Amount or PkScript) —
+		// kept on the function signature for caller compatibility.
+		_ = inputs[i]
+		// "witnessScript" is now the legacy P2SH redeem script —
+		// what the input's scriptSig must reveal so its hash matches
+		// the deposit address's scriptPubKey HASH160.
+		redeemScript := witnessScripts[i]
 
-		sigHashes := txscript.NewTxSigHashes(tx, txscript.NewCannedPrevOutputFetcher(utxo.PkScript, utxo.Amount))
-
-		sigHash, err := txscript.CalcWitnessSigHash(
-			witnessScript,
-			sigHashes,
+		// Audit FD4-C1: legacy P2SH sighash, NOT BIP143 witness sighash.
+		// CalcSignatureHash hashes the tx with the redeem script
+		// substituted into the input's scriptSig slot, per BIP16 +
+		// the original Bitcoin signing rules. utxo.Amount and the
+		// per-tx sighash cache are unused on this path.
+		sigHash, err := txscript.CalcSignatureHash(
+			redeemScript,
 			txscript.SigHashAll,
 			tx,
 			i,
-			utxo.Amount,
 		)
-
 		if err != nil {
 			return nil, err
 		}
@@ -455,9 +486,12 @@ func signSpendTransaction(tx *wire.MsgTx, inputs []*Utxo, witnessScripts map[int
 		sdk.TssSignKey(constants.TssKeyName, sigHash)
 
 		unsignedSigHashes[i] = UnsignedSigHash{
-			Index:         uint32(i),
-			SigHash:       sigHash,
-			WitnessScript: witnessScript,
+			Index: uint32(i),
+			SigHash: sigHash,
+			// Semantically the redeem script for legacy P2SH; the
+			// struct field name is preserved for msgp wire compat
+			// (tag `ws`).
+			WitnessScript: redeemScript,
 		}
 	}
 

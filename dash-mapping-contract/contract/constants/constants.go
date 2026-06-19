@@ -57,6 +57,12 @@ const (
 	DestinationChainKey = "destination_chain"
 	ReturnAddressKey    = "return_address"
 	ReturnNetworkKey    = "return_network"
+	// MinAmountOutKey lets a deposit-swap instruction carry a slippage
+	// bound (audit FD-SLIP / BTC DX-H5). It is baked into the deposit
+	// address (part of the hashed instruction), so the depositor
+	// commits to a minimum output up front. Without it the ingress
+	// swap executed at any price (sandwichable).
+	MinAmountOutKey = "min_amount_out"
 )
 
 // Address Creation
@@ -104,8 +110,14 @@ const MaxBaseFeeRate int64 = 500
 
 // MaxBlockRetention is the number of recent block headers to keep.
 // Older headers are pruned during addBlocks to prevent unbounded state growth.
-// keep a week worth of headers to allow addresses to be registered after the fact
-const MaxBlockRetention = 1080
+//
+// Audit FD-RETENTION (4.3): BTC's 1080 = 1080×10min = 7.5d "week of
+// headers". Dash blocks are 2.5min → 1080 blocks is only 1.875 days.
+// A `map` arriving more than ~1.9d after a deposit would permanently
+// fail (header gone, no proof). Bump to 4320 = 4320×2.5min = 7.5d to
+// match BTC's wall-clock retention. Dash already adjusted BackupCSVBlocks
+// by ×4 but missed this one.
+const MaxBlockRetention = 4320
 
 // MaxPrunePerCall limits how many old headers are deleted in a single
 // addBlocks invocation to keep gas usage predictable.
