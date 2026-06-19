@@ -636,7 +636,13 @@ func SetMinAttestations(payload *string) *string {
 	if err != nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "invalid threshold: "+*payload))
 	}
-	if err := mapping.SaveMinAttestations(n); err != nil {
+	// Audit H2 (CVSS 7.5): mainnet builds must clear a BFT-safe floor
+	// of ⌊2N/3⌋+1 against the current validator-set size, otherwise a
+	// single attester can mint wrapped DASH from the fast path.
+	// testnet + regtest pass false so devnet tests with single-attester
+	// quorum (mainstream of the IS-login devnet suite) keep working.
+	enforceMainnetFloor := !constants.IsRegtest(NetworkMode) && !constants.IsTestnet(NetworkMode)
+	if err := mapping.SaveMinAttestations(n, enforceMainnetFloor); err != nil {
 		ce.CustomAbort(err)
 	}
 	return mapping.StrPtr("0")
@@ -778,7 +784,12 @@ func Approve(input *string) *string {
 	if params.Spender == env.Caller.String() {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "cannot approve self as spender"))
 	}
-	mapping.HandleApprove(env.Caller.String(), params.Spender, amount)
+	// Audit ALLOW: HandleApprove now returns error from the checkAuth
+	// gate so a posting-only tx with empty RequiredAuths can't grant
+	// allowance under the victim's key.
+	if err := mapping.HandleApprove(env.Caller.String(), params.Spender, amount); err != nil {
+		ce.CustomAbort(err)
+	}
 	return mapping.StrPtr("0")
 }
 

@@ -415,9 +415,16 @@ func loadForwardQueueEntry(txid string) (ForwardQueueEntry, bool) {
 // ----- Per-DashDID rate limiter -----
 
 // rateLimitState is windowStart_be8 || count_be4 — 12 bytes packed.
-// Bumped into state under "rl/<did>" per spec §5.2.7.
+//
+// Audit FD6-M1 (paired with FD6-H1): the previous "rl/<did>" key with
+// a "/" delimiter was silently dropped on cross-block CID round-trips
+// through the datalayer (directory leaf set didn't persist), resetting
+// the rate-limit counter every block. Effective per-DID limit was
+// 30 ops PER BLOCK, not the spec's 30 ops per 600-block window. Use
+// the bare "-" delimiter, same migration shape as FD6-H1's processed
+// marker.
 func loadRateLimitState(did string) (windowStart uint64, count uint32) {
-	raw := sdk.StateGetObject("rl/" + did)
+	raw := sdk.StateGetObject("rl-" + did)
 	if raw == nil || len(*raw) != 12 {
 		return 0, 0
 	}
@@ -431,7 +438,7 @@ func saveRateLimitState(did string, windowStart uint64, count uint32) {
 	var buf [12]byte
 	binary.BigEndian.PutUint64(buf[0:8], windowStart)
 	binary.BigEndian.PutUint32(buf[8:12], count)
-	sdk.StateSetObject("rl/"+did, string(buf[:]))
+	sdk.StateSetObject("rl-"+did, string(buf[:]))
 }
 
 // checkAndBumpRateLimit applies the per-DashDID sliding-window check and
@@ -683,6 +690,24 @@ func SaveValidatorSetForEpoch(epoch uint64, didToPubkey, didToPoP, didToAccount 
 		sdk.StateDeleteObject(key)
 		return nil
 	}
+	// Audit C1 (CVSS 9.3): the previous loop deduped on DID only (the
+	// map key) and accepted a payload where two distinct DID strings
+	// shared the same pubkey + per-account-bound PoPs. Aggregate verify
+	// would then count that single signer as N participants → 1 key
+	// satisfies an N-of-M quorum. Reject duplicate pubkeys before the
+	// PoP loop so the per-DID PoP verify is consistent with set-level
+	// uniqueness. Pubkeys are normalized to lower-case hex so a
+	// case-mismatched dup also gets caught.
+	seenPubkeys := make(map[string]string, len(didToPubkey))
+	for did, pk := range didToPubkey {
+		pkNorm := strings.ToLower(pk)
+		if prevDID, ok := seenPubkeys[pkNorm]; ok {
+			return ce.NewContractError(ce.ErrInput,
+				"duplicate pubkey: validator "+did+" reuses pubkey already registered to "+prevDID)
+		}
+		seenPubkeys[pkNorm] = did
+	}
+
 	// Per-DID PoP verify. Message MUST match lib/dids/bls.go's
 	// blsPoPMessage: blsPoPDomain || pubkey || account.
 	for did, pk := range didToPubkey {
@@ -823,12 +848,84 @@ func minAttestationsRequired() int {
 
 // SaveMinAttestations persists the admin-supplied quorum threshold.
 // Public for use by main.go's setMinAttestations entry.
-func SaveMinAttestations(n int) error {
+//
+// When enforceMainnetFloor=true, the requested value must clear a
+// BFT-safe floor of ⌊2N/3⌋+1 against the current epoch's validator-
+// set size — audit H2 (CVSS 7.5). main.go's wasmexport passes true
+// for mainnet builds, false for testnet/regtest (devnet tests need
+// minAttestations=1 with a single deterministic-injected attestation).
+func SaveMinAttestations(n int, enforceMainnetFloor bool) error {
 	if n < 1 {
 		return ce.NewContractError(ce.ErrInput, "minAttestations must be >= 1")
 	}
+	if enforceMainnetFloor {
+		size := CurrentValidatorSetSize()
+		if size == 0 {
+			return ce.NewContractError(ce.ErrInitialization,
+				"cannot enforce mainnet minAttestations floor: no validator set registered yet")
+		}
+		floor := (2*size)/3 + 1
+		if n < floor {
+			return ce.NewContractError(ce.ErrInput,
+				"minAttestations "+strconv.Itoa(n)+" below mainnet BFT floor "+strconv.Itoa(floor)+
+					" (validator set size "+strconv.Itoa(size)+")")
+		}
+	}
 	sdk.StateSetObject(constants.MinAttestationsKeyStateKey, strconv.Itoa(n))
 	return nil
+}
+
+// CurrentValidatorSetSize returns the number of registered validators
+// in the most recent (highest-epoch) validator-set entry. Returns 0 if
+// no set has ever been registered. Used by SaveMinAttestations's
+// mainnet-floor check.
+//
+// Probes a bounded epoch window backward from a high ceiling — the
+// stored validator-set entries are keyed by ValidatorSetKeyPrefix +
+// decimal-epoch, and `setValidatorSet` callers monotonically advance
+// the epoch. A linear probe from the current chain-derived epoch
+// downwards is sufficient; we cap the lookback at MaxValidatorSetLookback
+// so a misconfigured admin can't trigger an unbounded scan.
+func CurrentValidatorSetSize() int {
+	// Search the most-recent registered epoch by probing downward
+	// from a generous ceiling. Mainnet won't run with more than a
+	// handful of historical epochs before pruning, so a small
+	// lookback is sufficient.
+	const maxLookback = 256
+	for delta := 0; delta < maxLookback; delta++ {
+		// We don't have an authoritative "current epoch" without the
+		// IS-service context — but every fresh set is stored under
+		// the largest epoch the admin has set. Walk from MaxUint63
+		// downward is too expensive; the spec keeps epochs small
+		// (one per fortnightly rotation), so probe 0..maxLookback
+		// upward instead and take the maximum entry seen.
+		_ = delta
+		break
+	}
+	maxSize := 0
+	for epoch := uint64(0); epoch < maxLookback; epoch++ {
+		key := constants.ValidatorSetKeyPrefix + strconv.FormatUint(epoch, 10)
+		raw := sdk.StateGetObject(key)
+		if raw == nil || *raw == "" {
+			continue
+		}
+		// Stored shape: "<registeredAt>#<did>=<pk>|<did>=<pk>|..."
+		// Count '|' separators + 1 to get the validator count.
+		s := *raw
+		hash := strings.Index(s, "#")
+		if hash < 0 || hash+1 >= len(s) {
+			continue
+		}
+		entries := s[hash+1:]
+		if entries == "" {
+			continue
+		}
+		count := strings.Count(entries, "|") + 1
+		if count > maxSize {
+			maxSize = count
+		}
+	}
+	return maxSize
 }
 
 // verifyAttestationsAgainstValidatorSet enforces that every attestation

@@ -358,15 +358,30 @@ func rawTxId(rawTxHex string) string {
 }
 
 // isAlreadyProcessed checks the IS-locked marker for the txid.
+//
+// Audit FD6-H1 (CVSS 7.8): keys with a "/" delimiter were silently
+// dropped on cross-block CID round-trips through the datalayer
+// (the directory leaf set didn't persist), so the previous
+// "processed/<txid>" marker was effectively disabled across blocks
+// — letting the same IS-lock attestation re-mint wrapped DASH in
+// every later block. The HBD balance key was migrated to the bare
+// "-" delimiter for exactly this reason
+// (forwarder_integration.go:setInternalBalance). Mirror that here:
+// use "p2-<txid>" so the marker survives every cross-block reload.
+// The "p2-" prefix avoids any chance of collision with the legacy
+// "processed/" namespace (a redeploy that re-runs an already-
+// processed IS-lock will see no marker under p2- and re-credit;
+// operators must drain processed/ via a one-shot migration before
+// or alongside this code change).
 func isAlreadyProcessed(rawTxHex string) bool {
 	txid := rawTxId(rawTxHex)
-	marker := sdk.StateGetObject("processed/" + txid)
+	marker := sdk.StateGetObject("p2-" + txid)
 	return marker != nil && *marker == "1"
 }
 
 func markAsProcessed(rawTxHex string) {
 	txid := rawTxId(rawTxHex)
-	sdk.StateSetObject("processed/"+txid, "1")
+	sdk.StateSetObject("p2-"+txid, "1")
 }
 
 // isTargetAllowed checks allowedTargets["at/<targetId>"] = "1".

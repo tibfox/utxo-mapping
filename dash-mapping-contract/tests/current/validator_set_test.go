@@ -203,11 +203,14 @@ func TestValidateHiveAccount(t *testing.T) {
 }
 
 func TestSaveMinAttestations_RejectsZero(t *testing.T) {
-	err := mapping.SaveMinAttestations(0)
+	// Audit H2: SaveMinAttestations now takes enforceMainnetFloor bool;
+	// pass false here to exercise the n<1 rejection independent of the
+	// mainnet-floor branch.
+	err := mapping.SaveMinAttestations(0, false)
 	assert.Error(t, err)
 }
 
 func TestSaveMinAttestations_RejectsNegative(t *testing.T) {
-	err := mapping.SaveMinAttestations(-5)
+	err := mapping.SaveMinAttestations(-5, false)
 	assert.Error(t, err)
 }
