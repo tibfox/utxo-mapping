@@ -156,12 +156,26 @@ func (ms *MappingState) processUtxos(relevantUtxos []Utxo, from string, blockHei
 				continue
 			}
 
+			// Audit FD3-1 (HIGH 8.0): cross-check the canonical txid:vout
+			// idempotency marker the fast path also writes. If the
+			// fast path (mapInstantSendV2) already credited this
+			// specific deposit-output, skip the slow-path credit —
+			// otherwise a tx that lands in BOTH the fast-path
+			// attestation bundle AND the slow-path block-replay is
+			// credited TWICE.
+			if isAlreadyProcessedV2(utxo.TxId, utxo.Vout) {
+				continue
+			}
+
 			utxoInternalId, err := ms.allocateConfirmedId()
 			if err != nil {
 				return err
 			}
 			ms.UtxoList = append(ms.UtxoList, UtxoRegistryEntry{Id: utxoInternalId, Amount: utxo.Amount})
 			saveUtxo(utxoInternalId, &utxo)
+			// Audit FD3-1: write the canonical marker on the slow path
+			// too so a subsequent fast-path replay short-circuits.
+			markAsProcessedV2(utxo.TxId, utxo.Vout)
 
 			// Mark observed
 			observedList = append(observedList, entry)

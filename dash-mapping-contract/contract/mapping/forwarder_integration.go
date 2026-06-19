@@ -86,6 +86,26 @@ func validateHiveAccountSegment(seg string) error {
 // fast path. Carries the validator attestations bundle + the instruction
 // string the user paid for + the epoch the attestations were collected at.
 //
+// Audit C2 (CRIT 9.1) / H1 (HIGH 7.8) / FD3-1 (HIGH 8.0): the fast path
+// now also REQUIRES an SPV inclusion proof — the same shape as the slow
+// path's VerificationRequest. The proof binds the rawTx to a block
+// header the oracle has already chain-relayed into state. With this:
+//
+//   - C2 closed: the contract no longer trusts an unconfirmed
+//     submitter-supplied rawTx. The credit only fires after both the
+//     BLS quorum attests AND the tx is proven included in a confirmed
+//     block. A fabricated never-broadcast tx fails the merkle verify.
+//   - H1 closed: on the success path the UTXO is registered into
+//     ms.UtxoList + Supply.{ActiveSupply,UserSupply} is bumped, so
+//     the wrapped DASH is backed by an actual on-chain UTXO. Unmap
+//     spends real UTXOs corresponding to real deposits.
+//   - FD3-1 closed: idempotency now keys on txid:vout (txid is
+//     deterministic from rawTxBytes; vout is the index of the
+//     payee output to the derived deposit address). The same key
+//     is checked by both fast and slow paths, so a tx that lands
+//     in BOTH the fast-path bundle AND the slow-path block-replay
+//     is credited exactly once.
+//
 //tinyjson:json
 type MapInstantSendV2Params struct {
 	RawTxHex     string                 `json:"raw_tx_hex"`
@@ -97,6 +117,17 @@ type MapInstantSendV2Params struct {
 	// rather than read in-contract so the test framework has an explicit
 	// hook. Must match NetworkMode's expected vsc network id.
 	ChainId string `json:"chain_id"`
+	// BlockHeight is the height of the block carrying rawTxHex. The
+	// contract reads the stored block header at this height and runs
+	// the standard Merkle inclusion verify.
+	BlockHeight uint32 `json:"block_height"`
+	// MerkleProofHex is the hex-encoded sibling-hash list for the
+	// inclusion proof. Same wire format as VerificationRequest.
+	MerkleProofHex string `json:"merkle_proof_hex"`
+	// TxIndex is rawTx's position in the block; needed for
+	// verifyMerkleProof to know which sibling-pair side to take at
+	// each level.
+	TxIndex uint32 `json:"tx_index"`
 }
 
 // ValidatorAttestation is one signed entry from a Magi validator's
@@ -289,25 +320,43 @@ func resolveDashDIDFromTxInputs(tx *wire.MsgTx, dashGenesisCAIP2Hex string, netP
 // to verify the user actually paid to D and to derive the actualISAmount
 // for amount-matching.
 func FindOutputAmount(rawTxHex, targetAddress string, netParams *chaincfg.Params) (int64, error) {
+	total, _, err := FindOutputAmountAndIndex(rawTxHex, targetAddress, netParams)
+	return total, err
+}
+
+// FindOutputAmountAndIndex extends FindOutputAmount with the position of
+// the first output paying to targetAddress. Audit FD3-1: used as the
+// canonical `txid:vout` idempotency marker on the fast path, so the
+// slow-path SPV re-credit can detect "already credited via fast path"
+// and skip. Returns (totalAmount, firstMatchingVout, err). If no
+// output matches, firstMatchingVout is 0 and totalAmount is 0 — the
+// caller checks `totalAmount == 0` for the "not found" case.
+func FindOutputAmountAndIndex(rawTxHex, targetAddress string, netParams *chaincfg.Params) (int64, uint32, error) {
 	rawTxBytes, err := hex.DecodeString(rawTxHex)
 	if err != nil {
-		return 0, ce.NewContractError(ce.ErrInput, "raw tx not hex")
+		return 0, 0, ce.NewContractError(ce.ErrInput, "raw tx not hex")
 	}
 	var msgTx wire.MsgTx
 	if err := msgTx.Deserialize(bytes.NewReader(rawTxBytes)); err != nil {
-		return 0, ce.NewContractError(ce.ErrInput, "raw tx parse: "+err.Error())
+		return 0, 0, ce.NewContractError(ce.ErrInput, "raw tx parse: "+err.Error())
 	}
 	var total int64
-	for _, out := range msgTx.TxOut {
+	var firstVout uint32
+	firstSeen := false
+	for i, out := range msgTx.TxOut {
 		_, addrs, _, err := txscript.ExtractPkScriptAddrs(out.PkScript, netParams)
 		if err != nil || len(addrs) == 0 {
 			continue
 		}
 		if addrs[0].EncodeAddress() == targetAddress {
 			total += out.Value
+			if !firstSeen {
+				firstVout = uint32(i)
+				firstSeen = true
+			}
 		}
 	}
-	return total, nil
+	return total, firstVout, nil
 }
 
 // ----- BLS canonical signing message -----

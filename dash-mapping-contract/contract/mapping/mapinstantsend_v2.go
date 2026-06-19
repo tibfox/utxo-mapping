@@ -50,7 +50,7 @@ func (ms *MappingState) HandleMapInstantSendV2(params MapInstantSendV2ParamsFull
 		return ce.NewContractError(ce.ErrInput, "deposit address derivation failed: "+err.Error())
 	}
 
-	paidAmount, err := FindOutputAmount(body.RawTxHex, D, ms.NetworkParams)
+	paidAmount, vout, err := FindOutputAmountAndIndex(body.RawTxHex, D, ms.NetworkParams)
 	if err != nil {
 		return ce.NewContractError(ce.ErrInput, "could not parse tx outputs: "+err.Error())
 	}
@@ -61,13 +61,47 @@ func (ms *MappingState) HandleMapInstantSendV2(params MapInstantSendV2ParamsFull
 
 	// ===== Step 1.5: idempotency short-circuit BEFORE crypto + state writes =====
 	//
-	// Fixes audit findings `mapv2-expensive-before-idempotency` and
-	// `rate-limit-bumped-before-idempotency-check`: replays of an
-	// already-processed tx must short-circuit before BLS verify (which
-	// burns crypto gas) and before checkAndBumpRateLimit (which mutates
-	// state and would otherwise grief the victim's rate-limit budget).
-	if isAlreadyProcessed(body.RawTxHex) {
+	// Audit FD3-1 (HIGH 8.0): idempotency now keys on `txid:vout` so
+	// both the fast path and the slow `map` action's per-output credit
+	// can detect "already processed" against the SAME marker. The
+	// txid is deterministic from rawTxBytes (sha256d, byte-reversed
+	// for display). vout is the position of the FIRST output paying
+	// to the derived deposit address.
+	//
+	// Fixes earlier audits `mapv2-expensive-before-idempotency` and
+	// `rate-limit-bumped-before-idempotency-check`: replays must
+	// short-circuit before BLS verify (which burns crypto gas) and
+	// before checkAndBumpRateLimit (which would grief the victim's
+	// rate-limit budget).
+	txid := rawTxId(body.RawTxHex)
+	if isAlreadyProcessedV2(txid, vout) {
 		return nil
+	}
+
+	// ===== Step 1.6: SPV inclusion proof verify (audit C2 CRIT 9.1) =====
+	//
+	// The fast path previously trusted the submitter-supplied rawTxHex
+	// without ever asking dashd whether the tx was mined or even existed.
+	// A BLS quorum signing over a fabricated rawTx then minted wrapped
+	// DASH from a tx that never existed. Require the same inclusion
+	// proof shape the slow path uses (VerificationRequest) so the
+	// credit only fires after the tx is proven in a confirmed block.
+	//
+	// We don't enforce a minimum confirmation depth here — that's the
+	// oracle's responsibility (it only chain-relays headers after
+	// sufficient confirmations; see CLAUDE.md § Security Model).
+	rawTxBytes, decErr := hex.DecodeString(body.RawTxHex)
+	if decErr != nil {
+		return ce.NewContractError(ce.ErrInput, "raw tx not hex: "+decErr.Error())
+	}
+	spvReq := &VerificationRequest{
+		BlockHeight:    body.BlockHeight,
+		RawTxHex:       body.RawTxHex,
+		MerkleProofHex: body.MerkleProofHex,
+		TxIndex:        body.TxIndex,
+	}
+	if err := verifyTransaction(spvReq, rawTxBytes); err != nil {
+		return ce.Prepend(err, "fast-path SPV verify failed")
 	}
 
 	// ===== Step 2: verify BLS aggregate attestation =====
@@ -164,13 +198,56 @@ func (ms *MappingState) HandleMapInstantSendV2(params MapInstantSendV2ParamsFull
 	now := sdk.GetEnv().BlockHeight
 	withinLimit := checkAndBumpRateLimit(senderDID, now)
 
-	// ===== Step 6 + 7: credit + idempotency marker =====
+	// ===== Step 6: register UTXO + bump Supply (audit H1 HIGH 7.8) =====
+	//
+	// Previously the fast path only credited a-<did> without registering
+	// the underlying UTXO or bumping the protocol Supply ledger → unmap
+	// would drain real UTXOs that other users had deposited via the slow
+	// path. Mirror the slow path's MapDeposit case (mapping.go:159-164,
+	// 302-321) — register the proven UTXO into ms.UtxoList + bump
+	// Supply.{ActiveSupply,UserSupply}.
+	utxoInternalId, allocErr := ms.allocateConfirmedId()
+	if allocErr != nil {
+		return allocErr
+	}
+	ms.UtxoList = append(ms.UtxoList, UtxoRegistryEntry{Id: utxoInternalId, Amount: paidAmount})
+	// Build the Utxo record (TxId is the rawTx's sha256d hex, Vout is
+	// the deposit-address index found at Step 1).
+	depositUtxo := Utxo{
+		TxId:   txid,
+		Vout:   vout,
+		Amount: paidAmount,
+		// PkScript + Tag aren't required for the fast-path credit; the
+		// slow path populates them when it processes the same tx via a
+		// full block sweep. Leaving them zero here means the unmap path
+		// will need the slow-path block-walk to enrich them before the
+		// UTXO can be spent — that's fine because unmap relies on a
+		// confirmed-status promotion that the slow path drives.
+	}
+	saveUtxo(utxoInternalId, &depositUtxo)
+	newActive, sErr := safeAdd64(ms.Supply.ActiveSupply, paidAmount)
+	if sErr != nil {
+		return ce.WrapContractError(ce.ErrArithmetic, sErr, "supply.active overflow")
+	}
+	ms.Supply.ActiveSupply = newActive
+	newUser, sErr := safeAdd64(ms.Supply.UserSupply, paidAmount)
+	if sErr != nil {
+		return ce.WrapContractError(ce.ErrArithmetic, sErr, "supply.user overflow")
+	}
+	ms.Supply.UserSupply = newUser
+
+	// ===== Step 7: credit + canonical idempotency marker =====
 	// (idempotency-already-processed check ran at Step 1.5 above.)
 
 	if err := incInternalBalance(senderDID, "dash", paidAmount); err != nil {
 		return err
 	}
-	markAsProcessed(body.RawTxHex)
+	// Audit FD3-1: write the canonical txid:vout marker (checked by
+	// both fast + slow paths) instead of the legacy per-tx marker.
+	// The legacy markAsProcessed call has been removed — the per-txid
+	// "p2-<txid>" key is superseded by the more-precise
+	// "m-<txid>-<vout>" key.
+	markAsProcessedV2(txid, vout)
 
 	// ===== Step 8: op-specific path =====
 
@@ -375,31 +452,24 @@ func rawTxId(rawTxHex string) string {
 	return hex.EncodeToString(second[:])
 }
 
-// isAlreadyProcessed checks the IS-locked marker for the txid.
-//
-// Audit FD6-H1 (CVSS 7.8): keys with a "/" delimiter were silently
-// dropped on cross-block CID round-trips through the datalayer
-// (the directory leaf set didn't persist), so the previous
-// "processed/<txid>" marker was effectively disabled across blocks
-// — letting the same IS-lock attestation re-mint wrapped DASH in
-// every later block. The HBD balance key was migrated to the bare
-// "-" delimiter for exactly this reason
-// (forwarder_integration.go:setInternalBalance). Mirror that here:
-// use "p2-<txid>" so the marker survives every cross-block reload.
-// The "p2-" prefix avoids any chance of collision with the legacy
-// "processed/" namespace (a redeploy that re-runs an already-
-// processed IS-lock will see no marker under p2- and re-credit;
-// operators must drain processed/ via a one-shot migration before
-// or alongside this code change).
-func isAlreadyProcessed(rawTxHex string) bool {
-	txid := rawTxId(rawTxHex)
-	marker := sdk.StateGetObject("p2-" + txid)
+// isAlreadyProcessedV2 checks the canonical txid:vout idempotency
+// marker. Audit FD3-1 (HIGH 8.0) + FD6-H1 (HIGH 7.8): the marker is
+// shared between the fast path (mapInstantSendV2) and the slow path
+// (Map → processUtxos), so a tx that lands in BOTH is credited
+// exactly once. Key shape "m-<txid>-<vout>" uses the bare "-"
+// delimiter to survive cross-block CID round-trips through the
+// datalayer (the "/" delimiter was silently dropped on reload).
+func isAlreadyProcessedV2(txid string, vout uint32) bool {
+	marker := sdk.StateGetObject(canonicalProcessedKey(txid, vout))
 	return marker != nil && *marker == "1"
 }
 
-func markAsProcessed(rawTxHex string) {
-	txid := rawTxId(rawTxHex)
-	sdk.StateSetObject("p2-"+txid, "1")
+func markAsProcessedV2(txid string, vout uint32) {
+	sdk.StateSetObject(canonicalProcessedKey(txid, vout), "1")
+}
+
+func canonicalProcessedKey(txid string, vout uint32) string {
+	return "m-" + txid + "-" + strconv.FormatUint(uint64(vout), 10)
 }
 
 // isTargetAllowed checks allowedTargets["at/<targetId>"] = "1".
