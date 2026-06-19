@@ -25,8 +25,15 @@ const (
 	TestBackupPubKeyHex  = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
 )
 
+// regtestParams returns the Dash regtest chain params used by the
+// contract (init.go:dashRegTestParams). Pre-MX-L4 this returned BTC's
+// vanilla RegressionNetParams, which produced bcrt1q… P2WPKH test
+// addresses the contract correctly rejects under the audit fix.
 func regtestParams() *chaincfg.Params {
-	return &chaincfg.RegressionNetParams
+	p := chaincfg.RegressionNetParams
+	p.PubKeyHashAddrID = 0x8c // Dash 'y' prefix
+	p.ScriptHashAddrID = 0x13 // Dash '8'/'9' prefix
+	return &p
 }
 
 // encodeBalance encodes amount using the same compact big-endian binary
@@ -84,15 +91,19 @@ func decodeHex(t *testing.T, s string) string {
 	return string(b)
 }
 
-// regtestDestAddress returns a P2WPKH address derived from TestBackupPubKeyHex
-// on the regtest network (bcrt1q...).
+// regtestDestAddress returns a legacy P2PKH address derived from
+// TestBackupPubKeyHex on the regtest network (Dash regtest P2PKH
+// prefix = 'y', mainnet = 'X'). Audit MX-L4: the unmap path's
+// address-type guard refuses anything that isn't P2PKH or P2SH —
+// Dash never activated SegWit, so the previous P2WPKH (bcrt1q…)
+// test helper produced addresses the contract correctly rejects.
 func regtestDestAddress(t *testing.T) string {
 	t.Helper()
 	pubKeyBytes, err := hex.DecodeString(TestBackupPubKeyHex)
 	if err != nil {
 		t.Fatal("invalid test backup public key hex:", err)
 	}
-	addr, err := btcutil.NewAddressWitnessPubKeyHash(
+	addr, err := btcutil.NewAddressPubKeyHash(
 		btcutil.Hash160(pubKeyBytes),
 		regtestParams(),
 	)

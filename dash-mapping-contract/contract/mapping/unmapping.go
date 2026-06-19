@@ -357,6 +357,22 @@ func (cs *ContractState) buildSpendTransaction(
 		)
 	}
 
+	// Audit MX-L4 (LOW): explicit address-type guard. Dash supports
+	// legacy P2PKH (y…/X… prefix) and P2SH (8/9/7 prefix). Reject
+	// anything else (P2PK raw-pubkey, P2WSH/P2WPKH bech32 that
+	// dashd wouldn't accept post-decode anyway, weird future
+	// address kinds) so we don't construct a tx that mempool rejects
+	// AFTER the user's balance + UTXOs are already burned.
+	switch destAddr.(type) {
+	case *btcutil.AddressPubKeyHash, *btcutil.AddressScriptHash:
+		// OK
+	default:
+		return nil, nil, 0, ce.NewContractError(
+			ce.ErrInput,
+			"unsupported destination address type ["+destAddress+"]: only P2PKH (y…/X…) and P2SH (8/9/7…) are accepted",
+		)
+	}
+
 	// Create output script for destination
 	destScript, err := txscript.PayToAddrScript(destAddr)
 	if err != nil {
