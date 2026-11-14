@@ -168,20 +168,29 @@ func TestBTCC4_NoRefundToIsHeldAndOnlyTheOwnerReleasesIt(t *testing.T) {
 	assert.False(t, r.Success, "a hold is released once")
 }
 
+// Each half maps its own deposit, so each needs its own c4Map: that opens a
+// ContractTest (and its badger directory), released by the t.Cleanup c4Map
+// registers. Cleanup runs when the test that registered it ends, so two c4Map
+// calls in ONE test function hold two at once and the second dies on badger's
+// directory lock. A subtest per half ends — and so releases — before the next.
 func TestBTCC4_PayoutOnAnotherChainNeedsAHiveRefundTo(t *testing.T) {
 	// With no hive: refund_to the router would refund a failed payout to this
 	// contract: the swap is not attempted and the deposit is held.
-	e, r := c4Map(t, "swap_to="+c4SwapTo+"&swap_asset_out=ETH&destination_chain=ETH")
-	require.True(t, r.Success, "%s %s", r.Err, r.ErrMsg)
-	assert.Equal(t, c4UtxoAmount, e.bal(constants.RefundHoldAccount))
-	assert.Zero(t, e.bal(c4SwapTo))
-	assert.Contains(t, c4Log(r, "swaphold|"), "needs a hive: refund_to")
+	t.Run("no refund_to: the deposit is held", func(t *testing.T) {
+		e, r := c4Map(t, "swap_to="+c4SwapTo+"&swap_asset_out=ETH&destination_chain=ETH")
+		require.True(t, r.Success, "%s %s", r.Err, r.ErrMsg)
+		assert.Equal(t, c4UtxoAmount, e.bal(constants.RefundHoldAccount))
+		assert.Zero(t, e.bal(c4SwapTo))
+		assert.Contains(t, c4Log(r, "swaphold|"), "needs a hive: refund_to")
+	})
 
 	// With one, it is attempted, and the router's failure goes back to the sender.
-	e, r = c4Map(t, "swap_to="+c4SwapTo+"&swap_asset_out=ETH&destination_chain=ETH&refund_to="+c4RefundTo)
-	require.True(t, r.Success, "%s %s", r.Err, r.ErrMsg)
-	assert.Equal(t, c4UtxoAmount, e.bal(c4RefundTo))
-	assert.Zero(t, e.bal(constants.RefundHoldAccount))
+	t.Run("a hive: refund_to: back to the sender", func(t *testing.T) {
+		e, r := c4Map(t, "swap_to="+c4SwapTo+"&swap_asset_out=ETH&destination_chain=ETH&refund_to="+c4RefundTo)
+		require.True(t, r.Success, "%s %s", r.Err, r.ErrMsg)
+		assert.Equal(t, c4UtxoAmount, e.bal(c4RefundTo))
+		assert.Zero(t, e.bal(constants.RefundHoldAccount))
+	})
 }
 
 func TestBTCC4_ARefundToThatIsNotAHiveAccountIsHeld(t *testing.T) {
